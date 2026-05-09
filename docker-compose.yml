@@ -1,0 +1,46 @@
+version: "3.9"
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: sgs_cms
+      POSTGRES_USER: sgs
+      POSTGRES_PASSWORD: sgs_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  server:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.server
+    restart: unless-stopped
+    depends_on:
+      - db
+    environment:
+      NODE_ENV: production
+      PORT: 4000
+      DATABASE_URL: postgresql://sgs:sgs_password@db:5432/sgs_cms
+      JWT_ACCESS_SECRET: change_this_access_secret
+      JWT_REFRESH_SECRET: change_this_refresh_secret
+      ACCESS_TOKEN_EXPIRY: 8h
+      REFRESH_TOKEN_EXPIRY_DAYS: 7
+      BCRYPT_ROUNDS: 12
+      CORS_ORIGIN: http://localhost
+    ports:
+      - "4000:4000"
+
+  client:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.client
+    restart: unless-stopped
+    depends_on:
+      - server
+    ports:
+      - "80:80"
+
+volumes:
+  pgdata:

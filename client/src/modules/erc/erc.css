@@ -1,0 +1,20 @@
+@import url("https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=Space+Grotesk:wght@500;600;700&display=swap");
+
+.erc-module {
+  font-family: "Manrope", sans-serif;
+}
+
+.erc-module .fade-up {
+  animation: erc-fade-up 0.35s ease-out;
+}
+
+@keyframes erc-fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
