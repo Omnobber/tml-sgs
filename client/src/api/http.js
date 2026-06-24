@@ -1,8 +1,10 @@
 import axios from "axios";
 import { useAuthStore } from "../store/authStore";
 
+const apiBaseURL = import.meta.env.VITE_API_BASE_URL?.replace(/\/$/, "") || "/api";
+
 const http = axios.create({
-  baseURL: import.meta.env.VITE_API_BASE_URL || "http://localhost:4000/api"
+  baseURL: apiBaseURL
 });
 
 http.interceptors.request.use((config) => {
@@ -17,6 +19,12 @@ http.interceptors.response.use(
   (res) => res,
   async (error) => {
     const original = error.config;
+    console.error("API request failed:", {
+      method: original?.method,
+      url: original?.url,
+      status: error.response?.status,
+      message: error.response?.data?.message || error.response?.data?.error || error.message
+    });
     if (error.response?.status === 401 && !original._retry) {
       original._retry = true;
       const store = useAuthStore.getState();
@@ -25,7 +33,7 @@ http.interceptors.response.use(
         throw error;
       }
       try {
-        const { data } = await axios.post(`${http.defaults.baseURL}/auth/refresh`, {
+        const { data } = await axios.post(`${apiBaseURL}/auth/refresh`, {
           refreshToken: store.refreshToken
         });
         store.setSession(data);

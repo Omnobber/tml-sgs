@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Chart as ChartJS,
   CategoryScale,
@@ -7,15 +7,35 @@ import {
   LineElement,
   PointElement,
   ArcElement,
+  Filler,
   Title,
   Tooltip,
   Legend
 } from "chart.js";
 import { Bar, Doughnut, Line, Pie } from "react-chartjs-2";
+import toast, { Toaster } from "react-hot-toast";
 import { useAuthStore } from "../../store/authStore";
+import {
+  downloadSampleFmsWorkbook,
+  parseFmsImportWorkbook
+} from "./importHelpers";
+import { cleanText } from "./textUtils";
+import {
+  createFmsCallLog,
+  deleteFmsCallLog,
+  deleteFmsCallLogs,
+  fetchFmsCallLogs,
+  fetchFmsHealth,
+  fetchFmsImportErrors,
+  fetchFmsImportHistory,
+  rollbackLastFmsImport,
+  updateFmsCallLog,
+  uploadFmsImportChunk
+} from "./api";
 import "./fms.css";
+import callReportSeed from "./callReportSeed.json";
 
-ChartJS.register(CategoryScale, LinearScale, BarElement, LineElement, PointElement, ArcElement, Title, Tooltip, Legend);
+ChartJS.register(CategoryScale, LinearScale, BarElement, LineElement, PointElement, ArcElement, Filler, Title, Tooltip, Legend);
 
 const ENGINEERS = [
   "RATNESH SINGH - Team Leader",
@@ -304,21 +324,268 @@ function fmtDT(dt) {
 }
 
 function genIncNo(logData) {
-  const nums = logData.map((r) => parseInt((r.incidentNo || "INC000000").replace("INC", ""), 10) || 0);
+  const nums = logData.map((r) => parseInt(String(r.incidentNo || "").replace(/\D/g, ""), 10) || 0);
   const max = nums.length ? Math.max(...nums) : 0;
   return `INC${(max + 1).toString().padStart(6, "0")}`;
 }
 
+function normalizeComparable(value) {
+  return cleanText(value).toLowerCase();
+}
+
+function sameValue(left, right) {
+  return normalizeComparable(left) === normalizeComparable(right);
+}
+
+function parseNumber(value) {
+  const text = cleanText(value);
+  if (!text) return null;
+  const number = Number(text);
+  return Number.isFinite(number) ? number : null;
+}
+
+function excelSerialToIso(value) {
+  const serial = parseNumber(value);
+  if (serial === null) return cleanText(value);
+  const base = new Date(Date.UTC(1899, 11, 30));
+  const result = new Date(base.getTime() + serial * 24 * 60 * 60 * 1000);
+  return result.toISOString().slice(0, 16);
+}
+
+function normalizeDateValue(value) {
+  const text = cleanText(value);
+  if (!text) return "";
+  if (/^\d+(\.\d+)?$/.test(text)) return excelSerialToIso(text);
+  return text;
+}
+
+function normalizeStatus(value) {
+  return cleanText(value).toUpperCase();
+}
+
+function uniqueValues(records, key) {
+  const seen = new Set();
+  const values = [];
+  records.forEach((record) => {
+    const value = cleanText(record[key]);
+    if (!value) return;
+    const normalized = normalizeComparable(value);
+    if (seen.has(normalized)) return;
+    seen.add(normalized);
+    values.push(value);
+  });
+  return values.sort((left, right) => left.localeCompare(right, undefined, { sensitivity: "base" }));
+}
+
+const DASHBOARD_TIME_RANGE_OPTIONS = [
+  { key: "weekly", label: "Weekly" },
+  { key: "monthly", label: "Monthly" },
+  { key: "yearly", label: "Yearly" }
+];
+
+function parseDashboardDate(value) {
+  const text = cleanText(value);
+  if (!text) return null;
+  const date = new Date(text);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function startOfDay(date) {
+  const next = new Date(date);
+  next.setHours(0, 0, 0, 0);
+  return next;
+}
+
+function startOfWeek(date) {
+  const next = startOfDay(date);
+  const dayIndex = next.getDay();
+  const offset = (dayIndex + 6) % 7;
+  next.setDate(next.getDate() - offset);
+  return next;
+}
+
+function startOfMonth(date) {
+  const next = startOfDay(date);
+  next.setDate(1);
+  return next;
+}
+
+function startOfYear(date) {
+  const next = startOfDay(date);
+  next.setMonth(0, 1);
+  return next;
+}
+
+function getDashboardDate(record) {
+  return parseDashboardDate(record.callOpenDate) || parseDashboardDate(record.closedDate);
+}
+
+function getLatestDashboardDate(records) {
+  const dates = records
+    .map((record) => getDashboardDate(record))
+    .filter((date) => date instanceof Date && !Number.isNaN(date.getTime()))
+    .sort((left, right) => right.getTime() - left.getTime());
+  return dates[0] || null;
+}
+
+function isRecordWithinDashboardRange(record, range, referenceDate) {
+  const date = getDashboardDate(record);
+  if (!date) return false;
+
+  const now = referenceDate instanceof Date && !Number.isNaN(referenceDate.getTime()) ? referenceDate : new Date();
+  if (range === "weekly") return date >= startOfWeek(now) && date <= now;
+  if (range === "yearly") return date >= startOfYear(now) && date <= now;
+  return date >= startOfMonth(now) && date <= now;
+}
+
+function buildDashboardTrendSeries(records, range, referenceDate) {
+  const now = referenceDate instanceof Date && !Number.isNaN(referenceDate.getTime()) ? referenceDate : new Date();
+
+  if (range === "weekly") {
+    const labels = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const counts = Object.fromEntries(labels.map((label) => [label, 0]));
+    records.forEach((record) => {
+      const date = getDashboardDate(record);
+      if (!date) return;
+      const label = labels[(date.getDay() + 6) % 7];
+      counts[label] += 1;
+    });
+    return labels.map((label) => ({ label, value: counts[label] }));
+  }
+
+  if (range === "yearly") {
+    const labels = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const counts = Object.fromEntries(labels.map((label) => [label, 0]));
+    records.forEach((record) => {
+      const date = getDashboardDate(record);
+      if (!date || date.getFullYear() !== now.getFullYear()) return;
+      const label = labels[date.getMonth()];
+      counts[label] += 1;
+    });
+    return labels.map((label) => ({ label, value: counts[label] }));
+  }
+
+  const dayCount = new Date(now.getFullYear(), now.getMonth() + 1, 0).getDate();
+  const labels = Array.from({ length: dayCount }, (_, index) => String(index + 1).padStart(2, "0"));
+  const counts = Object.fromEntries(labels.map((label) => [label, 0]));
+  records.forEach((record) => {
+    const date = getDashboardDate(record);
+    if (!date || date.getFullYear() !== now.getFullYear() || date.getMonth() !== now.getMonth()) return;
+    const label = String(date.getDate()).padStart(2, "0");
+    counts[label] += 1;
+  });
+  return labels.map((label) => ({ label, value: counts[label] }));
+}
+
+function normalizeLogRecord(record = {}, options = {}) {
+  const defaultSyncStatus = options.defaultSyncStatus || "synced";
+  const normalized = {
+    ...record,
+    incidentNo: cleanText(record.incidentNo),
+    clientRequestId: cleanText(record.clientRequestId || record.client_request_id),
+    month: cleanText(record.month),
+    callOpenDate: normalizeDateValue(record.callOpenDate),
+    division: cleanText(record.division),
+    area: cleanText(record.area),
+    machine: cleanText(record.machine),
+    assetNo: cleanText(record.assetNo),
+    equipmentName: cleanText(record.equipmentName),
+    assetNonAsset: cleanText(record.assetNonAsset) || "Assets",
+    natureOfCall: cleanText(record.natureOfCall),
+    assetType: cleanText(record.assetType),
+    callCategory: cleanText(record.callCategory),
+    equipment: cleanText(record.equipment) || "N/A",
+    repeated: normalizeStatus(record.repeated) || "NO",
+    reportedBy: cleanText(record.reportedBy),
+    description: cleanText(record.description),
+    attendedBy: cleanText(record.attendedBy),
+    attendDate: normalizeDateValue(record.attendDate),
+    actionTaken: cleanText(record.actionTaken),
+    status: normalizeStatus(record.status) || "OPEN",
+    closedDate: normalizeDateValue(record.closedDate),
+    responseMinutes: parseNumber(record.responseMinutes),
+    resolutionMinutes: parseNumber(record.resolutionMinutes),
+    downtimeMinutes: parseNumber(record.downtimeMinutes),
+    pendingSide: cleanText(record.pendingSide),
+    remarks: cleanText(record.remarks),
+    syncStatus: cleanText(record.syncStatus) || (cleanText(record.clientRequestId || record.client_request_id) ? "pending" : defaultSyncStatus),
+    syncError: cleanText(record.syncError),
+    syncAction: cleanText(record.syncAction) || (cleanText(record.id) ? "synced" : "")
+  };
+
+  if (normalized.responseMinutes === null) {
+    const computed = calcMinutes(normalized.callOpenDate, normalized.attendDate);
+    normalized.responseMinutes = computed === "-" ? null : computed;
+  }
+
+  if (normalized.resolutionMinutes === null) {
+    const computed = calcMinutes(normalized.attendDate, normalized.closedDate);
+    normalized.resolutionMinutes = computed === "-" ? null : computed;
+  }
+
+  if (normalized.downtimeMinutes === null) {
+    const computed = calcMinutes(normalized.callOpenDate, normalized.closedDate);
+    normalized.downtimeMinutes = computed === "-" ? null : computed;
+  }
+
+  return normalized;
+}
+
+function normalizeLogData(records = [], options = {}) {
+  return Array.isArray(records) ? records.map((record) => normalizeLogRecord(record, options)) : [];
+}
+
+function getTimingValue(record, timingKey, startKey, endKey) {
+  const direct = record[timingKey];
+  if (direct !== undefined && direct !== null && direct !== "") return direct;
+  const computed = calcMinutes(record[startKey], record[endKey]);
+  return computed === "-" ? "" : computed;
+}
+
+function getTimingNumber(record, timingKey, startKey, endKey) {
+  const direct = record[timingKey];
+  if (direct !== undefined && direct !== null && direct !== "") {
+    const number = Number(direct);
+    return Number.isFinite(number) ? number : null;
+  }
+  const computed = calcMinutes(record[startKey], record[endKey]);
+  return computed === "-" ? null : computed;
+}
+
+function countMatches(records, key, value) {
+  return records.filter((record) => sameValue(record[key], value)).length;
+}
+
+const memoryStorage = new Map();
+
 function load(key, def) {
   try {
-    return JSON.parse(localStorage.getItem(key)) || def;
+    const raw = localStorage.getItem(key);
+    if (raw !== null) return JSON.parse(raw);
   } catch {
-    return def;
+    // Fall back to the in-memory cache or the provided default.
   }
+  if (memoryStorage.has(key)) {
+    try {
+      return JSON.parse(memoryStorage.get(key));
+    } catch {
+      return def;
+    }
+  }
+  return def;
 }
 
 function save(key, val) {
-  localStorage.setItem(key, JSON.stringify(val));
+  const serialized = JSON.stringify(val);
+  try {
+    localStorage.setItem(key, serialized);
+    memoryStorage.delete(key);
+    return true;
+  } catch (error) {
+    memoryStorage.set(key, serialized);
+    console.warn(`Unable to persist ${key} to localStorage; keeping it in memory for this session.`, error);
+    return false;
+  }
 }
 
 function getVisiblePages(totalPages, currentPage) {
@@ -420,7 +687,9 @@ const defaultLogForm = {
   area: "",
   machine: "",
   assetNo: "",
+  equipmentName: "",
   assetNonAsset: "Assets",
+  natureOfCall: "",
   assetType: "",
   callCategory: "",
   equipment: "N/A",
@@ -436,6 +705,8 @@ const defaultLogForm = {
   pendingSide: "TML",
   remarks: ""
 };
+
+const INITIAL_LOG_DATA = normalizeLogData(callReportSeed, { defaultSyncStatus: "seeded" });
 
 const defaultPMForm = {
   month: "",
@@ -489,18 +760,111 @@ const defaultAssetForm = {
   sapId: ""
 };
 
-export default function FMSModule() {
+const FMS_SYNC_RETRY_DELAYS_MS = [350, 1000, 2200];
+
+function createClientRequestId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `fms-${Date.now()}-${Math.random().toString(16).slice(2, 10)}`;
+}
+
+function getRecordSyncKey(record = {}) {
+  const clientRequestId = cleanText(record.clientRequestId || record.client_request_id);
+  if (clientRequestId) return `request:${clientRequestId.toLowerCase()}`;
+
+  const id = cleanText(record.id);
+  if (id) return `id:${id}`;
+
+  const incidentNo = cleanText(record.incidentNo);
+  if (incidentNo) return `incident:${incidentNo.toLowerCase()}`;
+
+  return `fallback:${cleanText(record.month).toLowerCase()}::${cleanText(record.machine).toLowerCase()}::${cleanText(record.description).toLowerCase()}`;
+}
+
+function sameLogRecord(left, right) {
+  return getRecordSyncKey(left) === getRecordSyncKey(right);
+}
+
+function stripLocalMetadata(record = {}) {
+  const { syncStatus, syncError, syncAction, ...payload } = record;
+  return payload;
+}
+
+function getApiErrorMessage(error, fallback) {
+  const responseData = error?.response?.data || {};
+  const details = Array.isArray(responseData.details)
+    ? responseData.details
+        .map((item) => {
+          if (!item) return "";
+          if (typeof item === "string") return item;
+          const path = item.path ? `${item.path}: ` : "";
+          return `${path}${item.message || ""}`.trim();
+        })
+        .filter(Boolean)
+    : [];
+  const networkMessage = error?.request && !error?.response ? "No response from the server." : "";
+  const message = responseData.message || responseData.error || error?.message || error?.code || networkMessage || fallback;
+  return details.length ? `${message} (${details.join("; ")})` : message;
+}
+
+function isRetryableSyncError(error) {
+  const status = error?.response?.status;
+  const code = error?.code;
+  return !status || [408, 425, 429, 500, 502, 503, 504].includes(status) || ["ERR_NETWORK", "ECONNABORTED", "ETIMEDOUT"].includes(code);
+}
+
+function validateLogRecord(record) {
+  const requiredFields = [
+    ["incidentNo", "Incident No."],
+    ["month", "Month"],
+    ["callOpenDate", "Call Open Date/Time"],
+    ["division", "Division"],
+    ["area", "Area"],
+    ["machine", "Device / Machine Name"],
+    ["natureOfCall", "Nature of Call"],
+    ["assetType", "Type of Assets"],
+    ["callCategory", "Call Category"],
+    ["description", "Call Description"]
+  ];
+
+  return requiredFields.filter(([key]) => !cleanText(record[key])).map(([, label]) => label);
+}
+
+function buildSyncPayload(record = {}) {
+  const payload = { ...stripLocalMetadata(record) };
+  delete payload.id;
+  return payload;
+}
+
+export default function FMSModule({ initialTab = "dashboard" }) {
   const userRole = useAuthStore((s) => s.user?.role || "");
   const canManage = userRole !== "client";
+  const canImport = ["admin", "super_admin", "supervisor"].includes(userRole);
+  const importPermissionMessage = "Only Admin and Supervisor roles can import Excel files.";
 
-  const [activeTab, setActiveTab] = useState("dashboard");
+  const [activeTab, setActiveTab] = useState(initialTab);
   const [currentDate, setCurrentDate] = useState(new Date());
+  const importFileRef = useRef(null);
 
-  const [logData, setLogData] = useState(() => load("sgs_log", SAMPLE_LOG));
+  const [logData, setLogData] = useState(() => {
+    const stored = normalizeLogData(load("sgs_log", INITIAL_LOG_DATA));
+    return stored.length ? stored : INITIAL_LOG_DATA;
+  });
   const [pmData, setPmData] = useState(() => load("sgs_pm", []));
   const [ibData, setIbData] = useState(() => load("sgs_ib", []));
   const [avData, setAvData] = useState(() => load("sgs_av", []));
   const [assetData, setAssetData] = useState(() => load("sgs_assets", SAMPLE_ASSETS));
+  const [importHistory, setImportHistory] = useState([]);
+  const [importProgress, setImportProgress] = useState(0);
+  const [importBusy, setImportBusy] = useState(false);
+  const [isSavingLog, setIsSavingLog] = useState(false);
+  const [isDeletingLog, setIsDeletingLog] = useState(false);
+  const [isSyncingPending, setIsSyncingPending] = useState(false);
+  const [isOnline, setIsOnline] = useState(typeof navigator !== "undefined" ? navigator.onLine : true);
+  const [serviceHealth, setServiceHealth] = useState({ status: "unknown", database: "unknown" });
+  const [importMessage, setImportMessage] = useState("");
+  const [dashboardTimeRange, setDashboardTimeRange] = useState("monthly");
 
   const [logFilter, setLogFilter] = useState({ division: "", area: "", status: "", month: "", assettype: "", category: "", search: "" });
   const [pmFilter, setPmFilter] = useState({ division: "", status: "", month: "" });
@@ -527,22 +891,96 @@ export default function FMSModule() {
   const [assetForm, setAssetForm] = useState(defaultAssetForm);
 
   const [logSort, setLogSort] = useState({ key: "", dir: 1 });
+  const [busy] = useState(false);
+  const [selectedLogKeys, setSelectedLogKeys] = useState([]);
+  const selectAllLogRef = useRef(null);
+  const logDataRef = useRef(logData);
+  const latestDashboardDate = useMemo(() => getLatestDashboardDate(logData), [logData]);
+  const pendingSyncCount = useMemo(() => getPendingLogRecords(logData).length, [logData]);
+
+  useEffect(() => {
+    logDataRef.current = logData;
+  }, [logData]);
 
   useEffect(() => {
     const timer = setInterval(() => setCurrentDate(new Date()), 30000);
     return () => clearInterval(timer);
   }, []);
 
+  const dashboardReferenceDate = useMemo(() => {
+    if (!logData.length) return currentDate;
+    const hasRangeData = logData.some((record) => isRecordWithinDashboardRange(record, dashboardTimeRange, currentDate));
+    return hasRangeData ? currentDate : latestDashboardDate || currentDate;
+  }, [currentDate, dashboardTimeRange, latestDashboardDate, logData]);
+
+  const dashboardPeriodLabel = useMemo(() => {
+    if (dashboardTimeRange === "monthly") {
+      return dashboardReferenceDate.toLocaleString("en-IN", { month: "long", year: "numeric" });
+    }
+    if (dashboardTimeRange === "yearly") {
+      return dashboardReferenceDate.getFullYear().toString();
+    }
+    return dashboardTimeRange.charAt(0).toUpperCase() + dashboardTimeRange.slice(1);
+  }, [dashboardReferenceDate, dashboardTimeRange]);
+
   useEffect(() => {
-    if (!logFilter.division) {
-      setLogFilter((prev) => ({ ...prev, area: "" }));
-      return;
+    let cancelled = false;
+
+    const syncRemoteCalls = async () => {
+      try {
+        const remoteCalls = await fetchFmsCallLogs();
+        if (cancelled || !Array.isArray(remoteCalls) || !remoteCalls.length) return;
+
+        setLogData((current) => {
+          const merged = mergeLogRecords(current, remoteCalls);
+          save("sgs_log", merged);
+          return merged;
+        });
+      } catch {
+        // Keep the seeded/local dataset when the API is unavailable.
+      }
+    };
+
+    const syncImportHistory = async () => {
+      try {
+        const history = await fetchFmsImportHistory();
+        if (!cancelled) {
+          setImportHistory(Array.isArray(history) ? history : []);
+        }
+      } catch {
+        if (!cancelled) setImportHistory([]);
+      }
+    };
+
+    const handleOnline = () => {
+      setIsOnline(true);
+      refreshServiceHealth();
+      refreshRemoteLogs();
+      syncPendingCalls({ silent: true }).catch(() => {});
+    };
+
+    const handleOffline = () => {
+      setIsOnline(false);
+    };
+
+    refreshServiceHealth();
+    syncRemoteCalls();
+    syncImportHistory();
+    if (typeof navigator !== "undefined") {
+      setIsOnline(navigator.onLine);
+      if (navigator.onLine) {
+        syncPendingCalls({ silent: true }).catch(() => {});
+      }
     }
-    const options = AREAS[logFilter.division] || [];
-    if (logFilter.area && !options.includes(logFilter.area)) {
-      setLogFilter((prev) => ({ ...prev, area: "" }));
-    }
-  }, [logFilter.division, logFilter.area]);
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+
+    return () => {
+      cancelled = true;
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, [syncPendingCalls]);
 
   const uniqueMonths = useMemo(() => [...new Set(logData.map((r) => r.month).filter(Boolean))].sort(), [logData]);
 
@@ -555,20 +993,42 @@ export default function FMSModule() {
     [logData]
   );
 
+  const logDivisionOptions = useMemo(() => uniqueValues(logData, "division"), [logData]);
+  const logAreaOptions = useMemo(
+    () => uniqueValues(logData.filter((record) => !logFilter.division || sameValue(record.division, logFilter.division)), "area"),
+    [logData, logFilter.division]
+  );
+  const logAssetTypeOptions = useMemo(() => uniqueValues(logData, "assetType"), [logData]);
+  const logCallCategoryOptions = useMemo(() => uniqueValues(logData, "callCategory"), [logData]);
+  const logNatureOptions = useMemo(() => uniqueValues(logData, "natureOfCall"), [logData]);
+  const logAttendedByOptions = useMemo(() => uniqueValues(logData, "attendedBy"), [logData]);
+  const logReportedByOptions = useMemo(() => uniqueValues(logData, "reportedBy"), [logData]);
+  const logPendingSideOptions = useMemo(() => uniqueValues(logData, "pendingSide"), [logData]);
+
+  useEffect(() => {
+    if (logFilter.area && !logAreaOptions.some((option) => sameValue(option, logFilter.area))) {
+      setLogFilter((prev) => ({ ...prev, area: "" }));
+    }
+  }, [logAreaOptions, logFilter.area]);
+
   const logFiltered = useMemo(() => {
     const search = logFilter.search.trim().toLowerCase();
     const filtered = logRowsWithIndex.filter(
       (r) =>
-        (!logFilter.division || r.division === logFilter.division) &&
-        (!logFilter.area || r.area === logFilter.area) &&
-        (!logFilter.status || r.status === logFilter.status) &&
-        (!logFilter.month || r.month === logFilter.month) &&
-        (!logFilter.assettype || r.assetType === logFilter.assettype) &&
-        (!logFilter.category || r.callCategory === logFilter.category) &&
+        (!logFilter.division || sameValue(r.division, logFilter.division)) &&
+        (!logFilter.area || sameValue(r.area, logFilter.area)) &&
+        (!logFilter.status || sameValue(r.status, logFilter.status)) &&
+        (!logFilter.month || sameValue(r.month, logFilter.month)) &&
+        (!logFilter.assettype || sameValue(r.assetType, logFilter.assettype)) &&
+        (!logFilter.category || sameValue(r.callCategory, logFilter.category)) &&
         (!search ||
           (r.incidentNo || "").toLowerCase().includes(search) ||
           (r.machine || "").toLowerCase().includes(search) ||
-          (r.description || "").toLowerCase().includes(search))
+          (r.equipmentName || "").toLowerCase().includes(search) ||
+          (r.natureOfCall || "").toLowerCase().includes(search) ||
+          (r.description || "").toLowerCase().includes(search) ||
+          (r.reportedBy || "").toLowerCase().includes(search) ||
+          (r.attendedBy || "").toLowerCase().includes(search))
     );
     if (!logSort.key) return filtered;
     return [...filtered].sort((a, b) => {
@@ -579,6 +1039,82 @@ export default function FMSModule() {
       return 0;
     });
   }, [logRowsWithIndex, logFilter, logSort]);
+
+  const dashboardFilteredLogs = useMemo(
+    () => logData.filter((record) => isRecordWithinDashboardRange(record, dashboardTimeRange, dashboardReferenceDate)),
+    [dashboardReferenceDate, dashboardTimeRange, logData]
+  );
+
+  const dashboardDivisionOptions = useMemo(() => uniqueValues(dashboardFilteredLogs, "division"), [dashboardFilteredLogs]);
+  const dashboardAssetTypeOptions = useMemo(() => uniqueValues(dashboardFilteredLogs, "assetType"), [dashboardFilteredLogs]);
+  const dashboardCallCategoryOptions = useMemo(() => uniqueValues(dashboardFilteredLogs, "callCategory"), [dashboardFilteredLogs]);
+  const dashboardNatureOptions = useMemo(() => uniqueValues(dashboardFilteredLogs, "natureOfCall"), [dashboardFilteredLogs]);
+  const dashboardAttendedByOptions = useMemo(() => uniqueValues(dashboardFilteredLogs, "attendedBy"), [dashboardFilteredLogs]);
+  const dashboardReportedByOptions = useMemo(() => uniqueValues(dashboardFilteredLogs, "reportedBy"), [dashboardFilteredLogs]);
+  const dashboardPendingSideOptions = useMemo(() => uniqueValues(dashboardFilteredLogs, "pendingSide"), [dashboardFilteredLogs]);
+
+  const dashboardTotalDownMinutes = useMemo(
+    () =>
+      dashboardFilteredLogs
+        .map((record) => getTimingNumber(record, "downtimeMinutes", "callOpenDate", "closedDate"))
+        .filter((value) => value !== null)
+        .reduce((sum, value) => sum + value, 0),
+    [dashboardFilteredLogs]
+  );
+
+  const dashboardDownList = useMemo(
+    () => dashboardFilteredLogs.map((record) => getTimingNumber(record, "downtimeMinutes", "callOpenDate", "closedDate")).filter((value) => value !== null),
+    [dashboardFilteredLogs]
+  );
+
+  const dashboardAvgMTTR = dashboardDownList.length ? Math.round(dashboardTotalDownMinutes / dashboardDownList.length) : 0;
+  const dashboardOpenCalls = dashboardFilteredLogs.filter((record) => sameValue(record.status, "OPEN")).length;
+  const dashboardClosedCalls = dashboardFilteredLogs.filter((record) => sameValue(record.status, "CLOSED")).length;
+  const dashboardHoldCalls = dashboardFilteredLogs.filter((record) => sameValue(record.status, "HOLD")).length;
+
+  const dashboardDivisionCounts = useMemo(() => {
+    const result = {};
+    dashboardDivisionOptions.forEach((division) => {
+      result[division] = countMatches(dashboardFilteredLogs, "division", division);
+    });
+    return result;
+  }, [dashboardDivisionOptions, dashboardFilteredLogs]);
+
+  const dashboardDivisionDowntime = useMemo(() => {
+    const result = {};
+    dashboardDivisionOptions.forEach((division) => {
+      result[division] = dashboardFilteredLogs
+        .filter((record) => sameValue(record.division, division))
+        .map((record) => getTimingNumber(record, "downtimeMinutes", "callOpenDate", "closedDate"))
+        .filter((value) => value !== null)
+        .reduce((sum, value) => sum + value, 0);
+    });
+    return result;
+  }, [dashboardDivisionOptions, dashboardFilteredLogs]);
+
+  const dashboardDivisionAvgDown = useMemo(() => {
+    const result = {};
+    dashboardDivisionOptions.forEach((division) => {
+      result[division] = dashboardDivisionCounts[division] ? Math.round(dashboardDivisionDowntime[division] / dashboardDivisionCounts[division]) : 0;
+    });
+    return result;
+  }, [dashboardDivisionCounts, dashboardDivisionDowntime, dashboardDivisionOptions]);
+
+  const dashboardAssetTypeCounts = dashboardAssetTypeOptions.map((assetType) => countMatches(dashboardFilteredLogs, "assetType", assetType));
+  const dashboardAssetTypeFiltered = dashboardAssetTypeOptions.map((assetType, index) => ({ t: assetType, c: dashboardAssetTypeCounts[index] })).filter((item) => item.c > 0);
+  const dashboardNatureCounts = dashboardNatureOptions.map((nature) => countMatches(dashboardFilteredLogs, "natureOfCall", nature));
+  const dashboardCallCategoryCounts = dashboardCallCategoryOptions.map((category) => countMatches(dashboardFilteredLogs, "callCategory", category));
+
+  const dashboardStatusByDivision = {
+    OPEN: dashboardDivisionOptions.map((division) => dashboardFilteredLogs.filter((record) => sameValue(record.division, division) && sameValue(record.status, "OPEN")).length),
+    CLOSED: dashboardDivisionOptions.map((division) => dashboardFilteredLogs.filter((record) => sameValue(record.division, division) && sameValue(record.status, "CLOSED")).length),
+    HOLD: dashboardDivisionOptions.map((division) => dashboardFilteredLogs.filter((record) => sameValue(record.division, division) && sameValue(record.status, "HOLD")).length)
+  };
+
+  const dashboardMonthSeries = useMemo(
+    () => buildDashboardTrendSeries(dashboardFilteredLogs, dashboardTimeRange, dashboardReferenceDate),
+    [dashboardReferenceDate, dashboardFilteredLogs, dashboardTimeRange]
+  );
 
   const pmFiltered = useMemo(
     () =>
@@ -634,48 +1170,76 @@ export default function FMSModule() {
   const pagedIB = useMemo(() => ibFiltered.slice((ibPage - 1) * PAGE_SIZE, ibPage * PAGE_SIZE), [ibFiltered, ibPage]);
   const pagedAV = useMemo(() => avFiltered.slice((avPage - 1) * PAGE_SIZE, avPage * PAGE_SIZE), [avFiltered, avPage]);
   const pagedAssets = useMemo(() => assetFiltered.slice((assetPage - 1) * PAGE_SIZE, assetPage * PAGE_SIZE), [assetFiltered, assetPage]);
+  const logSelectionKeyForRow = (row) => String(row.clientRequestId || row.client_request_id || row.id || row.incidentNo || row.__idx);
+  const selectedLogRecords = useMemo(() => {
+    const keySet = new Set(selectedLogKeys);
+    return logData
+      .map((record, idx) => ({ record, idx, key: logSelectionKeyForRow({ ...record, __idx: idx }) }))
+      .filter((entry) => keySet.has(entry.key));
+  }, [logData, selectedLogKeys]);
+  const selectedLogCount = selectedLogRecords.length;
+  const selectedLogKeySet = useMemo(() => new Set(selectedLogKeys), [selectedLogKeys]);
+  const allFilteredLogsSelected = logFiltered.length > 0 && logFiltered.every((row) => selectedLogKeySet.has(logSelectionKeyForRow(row)));
+  const someFilteredLogsSelected = logFiltered.some((row) => selectedLogKeySet.has(logSelectionKeyForRow(row)));
+
+  useEffect(() => {
+    if (selectAllLogRef.current) {
+      selectAllLogRef.current.indeterminate = someFilteredLogsSelected && !allFilteredLogsSelected;
+    }
+  }, [allFilteredLogsSelected, someFilteredLogsSelected]);
+
+  useEffect(() => {
+    setSelectedLogKeys((current) => {
+      const validKeys = new Set(logRowsWithIndex.map((row) => logSelectionKeyForRow(row)));
+      const next = current.filter((key) => validKeys.has(key));
+      return next.length === current.length ? current : next;
+    });
+  }, [logRowsWithIndex]);
 
   const totalDownMinutes = useMemo(
-    () => logData.map((r) => calcMinutes(r.callOpenDate, r.closedDate)).filter((v) => v !== "-").reduce((a, b) => a + b, 0),
+    () =>
+      logData
+        .map((r) => getTimingNumber(r, "downtimeMinutes", "callOpenDate", "closedDate"))
+        .filter((v) => v !== null)
+        .reduce((a, b) => a + b, 0),
     [logData]
   );
-  const downList = useMemo(() => logData.map((r) => calcMinutes(r.callOpenDate, r.closedDate)).filter((v) => v !== "-"), [logData]);
+  const downList = useMemo(
+    () => logData.map((r) => getTimingNumber(r, "downtimeMinutes", "callOpenDate", "closedDate")).filter((v) => v !== null),
+    [logData]
+  );
   const avgMTTR = downList.length ? Math.round(totalDownMinutes / downList.length) : 0;
-  const openCalls = logData.filter((r) => r.status === "OPEN").length;
-  const closedCalls = logData.filter((r) => r.status === "CLOSED").length;
-  const holdCalls = logData.filter((r) => r.status === "HOLD").length;
+  const openCalls = logData.filter((r) => sameValue(r.status, "OPEN")).length;
+  const closedCalls = logData.filter((r) => sameValue(r.status, "CLOSED")).length;
+  const holdCalls = logData.filter((r) => sameValue(r.status, "HOLD")).length;
 
   const divisionCounts = useMemo(() => {
     const result = {};
-    DIVISIONS.forEach((d) => {
-      result[d] = 0;
-    });
-    logData.forEach((r) => {
-      if (r.division) result[r.division] = (result[r.division] || 0) + 1;
+    logDivisionOptions.forEach((division) => {
+      result[division] = countMatches(logData, "division", division);
     });
     return result;
-  }, [logData]);
+  }, [logData, logDivisionOptions]);
 
   const divisionDowntime = useMemo(() => {
     const result = {};
-    DIVISIONS.forEach((d) => {
-      result[d] = 0;
-    });
-    logData.forEach((r) => {
-      if (!r.division) return;
-      const d = calcMinutes(r.callOpenDate, r.closedDate);
-      if (d !== "-") result[r.division] = (result[r.division] || 0) + d;
+    logDivisionOptions.forEach((division) => {
+      result[division] = logData
+        .filter((record) => sameValue(record.division, division))
+        .map((record) => getTimingNumber(record, "downtimeMinutes", "callOpenDate", "closedDate"))
+        .filter((value) => value !== null)
+        .reduce((sum, value) => sum + value, 0);
     });
     return result;
-  }, [logData]);
+  }, [logData, logDivisionOptions]);
 
   const divisionAvgDown = useMemo(() => {
     const result = {};
-    DIVISIONS.forEach((d) => {
-      result[d] = divisionCounts[d] ? Math.round(divisionDowntime[d] / divisionCounts[d]) : 0;
+    logDivisionOptions.forEach((division) => {
+      result[division] = divisionCounts[division] ? Math.round(divisionDowntime[division] / divisionCounts[division]) : 0;
     });
     return result;
-  }, [divisionCounts, divisionDowntime]);
+  }, [divisionCounts, divisionDowntime, logDivisionOptions]);
 
   const monthMap = useMemo(() => {
     const result = {};
@@ -686,27 +1250,29 @@ export default function FMSModule() {
   }, [logData]);
 
   const monthLabels = useMemo(() => Object.keys(monthMap).sort(), [monthMap]);
-  const assetTypeCounts = ASSET_TYPES.map((t) => logData.filter((r) => r.assetType === t).length);
-  const assetTypeFiltered = ASSET_TYPES.map((t, i) => ({ t, c: assetTypeCounts[i] })).filter((x) => x.c > 0);
+  const assetTypeCounts = logAssetTypeOptions.map((assetType) => countMatches(logData, "assetType", assetType));
+  const assetTypeFiltered = logAssetTypeOptions.map((assetType, index) => ({ t: assetType, c: assetTypeCounts[index] })).filter((x) => x.c > 0);
+  const natureCounts = logNatureOptions.map((nature) => countMatches(logData, "natureOfCall", nature));
+  const callCategoryCounts = logCallCategoryOptions.map((category) => countMatches(logData, "callCategory", category));
   const statusByDivision = {
-    OPEN: DIVISIONS.map((d) => logData.filter((r) => r.division === d && r.status === "OPEN").length),
-    CLOSED: DIVISIONS.map((d) => logData.filter((r) => r.division === d && r.status === "CLOSED").length),
-    HOLD: DIVISIONS.map((d) => logData.filter((r) => r.division === d && r.status === "HOLD").length)
+    OPEN: logDivisionOptions.map((division) => logData.filter((record) => sameValue(record.division, division) && sameValue(record.status, "OPEN")).length),
+    CLOSED: logDivisionOptions.map((division) => logData.filter((record) => sameValue(record.division, division) && sameValue(record.status, "CLOSED")).length),
+    HOLD: logDivisionOptions.map((division) => logData.filter((record) => sameValue(record.division, division) && sameValue(record.status, "HOLD")).length)
   };
 
   const analysisRows = useMemo(
     () =>
-      DIVISIONS.map((division) => {
-        const calls = logData.filter((r) => r.division === division);
-        const downs = calls.map((r) => calcMinutes(r.callOpenDate, r.closedDate)).filter((v) => v !== "-");
-        const total = downs.reduce((a, b) => a + b, 0);
+      logDivisionOptions.map((division) => {
+        const calls = logData.filter((record) => sameValue(record.division, division));
+        const downs = calls.map((record) => getTimingNumber(record, "downtimeMinutes", "callOpenDate", "closedDate")).filter((value) => value !== null);
+        const total = downs.reduce((sum, value) => sum + value, 0);
         const avg = calls.length ? Math.round(total / calls.length) : 0;
         return { division, cnt: calls.length, tot: total, avg };
       })
         .filter((r) => r.cnt > 0)
         .sort((a, b) => b.avg - a.avg)
         .map((r, idx) => ({ ...r, rank: idx + 1 })),
-    [logData]
+    [logData, logDivisionOptions]
   );
 
   const totalAnalysisCount = analysisRows.reduce((a, r) => a + r.cnt, 0);
@@ -714,10 +1280,10 @@ export default function FMSModule() {
   const globalAnalysisAvg = totalAnalysisCount ? Math.round(totalAnalysisDowntime / totalAnalysisCount) : 0;
 
   const pivotData = useMemo(() => {
-    const colTotals = ASSET_TYPES.map(() => 0);
-    const rows = DIVISIONS.map((division) => {
-      const values = ASSET_TYPES.map((type, idx) => {
-        const count = logData.filter((r) => r.division === division && r.assetType === type).length;
+    const colTotals = logAssetTypeOptions.map(() => 0);
+    const rows = logDivisionOptions.map((division) => {
+      const values = logAssetTypeOptions.map((type, idx) => {
+        const count = logData.filter((record) => sameValue(record.division, division) && sameValue(record.assetType, type)).length;
         colTotals[idx] += count;
         return count;
       });
@@ -725,21 +1291,21 @@ export default function FMSModule() {
       return { division, values, total };
     });
     return { rows, colTotals, grandTotal: colTotals.reduce((a, b) => a + b, 0) };
-  }, [logData]);
+  }, [logData, logAssetTypeOptions, logDivisionOptions]);
 
   const engineerRows = useMemo(
     () =>
-      ENGINEERS.map((eng) => {
-        const calls = logData.filter((r) => r.attendedBy === eng);
-        const responses = calls.map((r) => calcMinutes(r.callOpenDate, r.attendDate)).filter((v) => v !== "-");
-        const resolutions = calls.map((r) => calcMinutes(r.attendDate, r.closedDate)).filter((v) => v !== "-");
-        const avgResponse = responses.length ? Math.round(responses.reduce((a, b) => a + b, 0) / responses.length) : 0;
-        const avgResolution = resolutions.length ? Math.round(resolutions.reduce((a, b) => a + b, 0) / resolutions.length) : 0;
-        const closed = calls.filter((r) => r.status === "CLOSED").length;
-        const openHold = calls.filter((r) => r.status !== "CLOSED").length;
+      logAttendedByOptions.map((eng) => {
+        const calls = logData.filter((record) => sameValue(record.attendedBy, eng));
+        const responses = calls.map((record) => getTimingNumber(record, "responseMinutes", "callOpenDate", "attendDate")).filter((value) => value !== null);
+        const resolutions = calls.map((record) => getTimingNumber(record, "resolutionMinutes", "attendDate", "closedDate")).filter((value) => value !== null);
+        const avgResponse = responses.length ? Math.round(responses.reduce((sum, value) => sum + value, 0) / responses.length) : 0;
+        const avgResolution = resolutions.length ? Math.round(resolutions.reduce((sum, value) => sum + value, 0) / resolutions.length) : 0;
+        const closed = calls.filter((record) => sameValue(record.status, "CLOSED")).length;
+        const openHold = calls.filter((record) => !sameValue(record.status, "CLOSED")).length;
         return { eng, total: calls.length, avgResponse, avgResolution, closed, openHold };
       }),
-    [logData]
+    [logAttendedByOptions, logData]
   );
 
   const baseBarOptions = { responsive: true, maintainAspectRatio: false, scales: { x: { ticks: { font: { size: 9 }, maxRotation: 30 } }, y: { ticks: { font: { size: 9 } } } } };
@@ -749,26 +1315,572 @@ export default function FMSModule() {
     setLogSort((prev) => (prev.key === key ? { key, dir: -prev.dir } : { key, dir: 1 }));
   }
 
+  function toggleLogSelection(rowKey) {
+    setSelectedLogKeys((current) => (current.includes(rowKey) ? current.filter((key) => key !== rowKey) : [...current, rowKey]));
+  }
+
+  function toggleAllFilteredLogs(checked) {
+    const filteredKeys = logFiltered.map((row) => logSelectionKeyForRow(row));
+    setSelectedLogKeys((current) => {
+      const currentSet = new Set(current);
+      if (checked) {
+        filteredKeys.forEach((key) => currentSet.add(key));
+      } else {
+        filteredKeys.forEach((key) => currentSet.delete(key));
+      }
+      return [...currentSet];
+    });
+  }
+
+  function clearSelectedLogs() {
+    setSelectedLogKeys([]);
+  }
+
+  function getSelectedLogEntries(targetKeys = selectedLogKeys) {
+    const keySet = new Set(targetKeys);
+    return logDataRef.current
+      .map((record, idx) => ({ record, idx, key: logSelectionKeyForRow({ ...record, __idx: idx }) }))
+      .filter((entry) => keySet.has(entry.key));
+  }
+
+  async function deleteLogEntries(targetKeys = selectedLogKeys) {
+    const entries = getSelectedLogEntries(targetKeys);
+    if (!entries.length) {
+      toast.error("Select one or more call records to delete.");
+      return;
+    }
+
+    const importedEntries = entries.filter(({ record }) => Boolean(record.importBatchId));
+    if (importedEntries.length) {
+      toast.error("Imported rows can only be removed through rollback.");
+      return;
+    }
+
+    const selectionLabel =
+      entries.length === 1
+        ? `Delete call ${entries[0].record.incidentNo || entries[0].record.id || ""}?`
+        : `Delete ${entries.length} selected call records?`;
+    if (!window.confirm(selectionLabel)) {
+      return;
+    }
+
+    const snapshot = logDataRef.current;
+    const targetKeySet = new Set(entries.map((entry) => entry.key));
+    const nextLocal = snapshot.filter((record, idx) => !targetKeySet.has(logSelectionKeyForRow({ ...record, __idx: idx })));
+    const serverIds = entries.map(({ record }) => record.id).filter((id) => Number.isInteger(Number(id)) && Number(id) > 0);
+
+    try {
+      setIsDeletingLog(true);
+
+      if (serverIds.length) {
+        if (typeof navigator !== "undefined" && navigator.onLine === false) {
+          throw new Error("You are offline right now.");
+        }
+
+        const health = await refreshServiceHealth();
+        if (health?.database && health.database !== "ok") {
+          throw new Error(health.message || "Database is temporarily unavailable.");
+        }
+
+        if (serverIds.length === 1) {
+          await deleteFmsCallLog(serverIds[0]);
+        } else {
+          await deleteFmsCallLogs(serverIds);
+        }
+      }
+
+      const normalized = normalizeLogData(nextLocal, { defaultSyncStatus: "synced" });
+      setLogData(normalized);
+      save("sgs_log", normalized);
+      setSelectedLogKeys((current) => current.filter((key) => !targetKeySet.has(key)));
+      await refreshRemoteLogs();
+      toast.success(entries.length === 1 ? "Call record deleted." : `${entries.length} call records deleted.`);
+    } catch (error) {
+      setLogData(snapshot);
+      save("sgs_log", snapshot);
+      const message = getApiErrorMessage(error, "Unable to delete the selected call record(s).");
+      console.error("FMS call delete failed:", {
+        message,
+        status: error?.response?.status,
+        code: error?.code,
+        selectedCount: entries.length,
+        serverIds
+      });
+      toast.error(message);
+    } finally {
+      setIsDeletingLog(false);
+    }
+  }
+
+  function mergeLogRecord(existing, incoming) {
+    const merged = { ...(existing || {}) };
+    Object.entries(incoming || {}).forEach(([key, value]) => {
+      if (value === undefined || value === null || value === "") return;
+      merged[key] = value;
+    });
+    if (existing?.clientRequestId && !merged.clientRequestId) {
+      merged.clientRequestId = existing.clientRequestId;
+    }
+    if (existing?.syncStatus && !merged.syncStatus) {
+      merged.syncStatus = existing.syncStatus;
+    }
+    if (existing?.syncError && !merged.syncError) {
+      merged.syncError = existing.syncError;
+    }
+    if (existing?.syncAction && !merged.syncAction) {
+      merged.syncAction = existing.syncAction;
+    }
+    return merged;
+  }
+
+  function mergeLogRecords(existing, incoming) {
+    const map = new Map();
+    existing
+      .filter((record) => !record.importBatchId)
+      .forEach((record) => {
+        const key = getRecordSyncKey(record);
+        if (!key) return;
+        map.set(key, record);
+      });
+    incoming.forEach((record) => {
+      const key = getRecordSyncKey(record);
+      if (!key) return;
+      map.set(key, mergeLogRecord(map.get(key), record));
+    });
+    return normalizeLogData([...map.values()]);
+  }
+
+  function refreshHistory() {
+    return fetchFmsImportHistory()
+      .then((history) => {
+        setImportHistory(Array.isArray(history) ? history : []);
+        return history;
+      })
+      .catch(() => []);
+  }
+
+  function refreshRemoteLogs() {
+    return fetchFmsCallLogs()
+      .then((calls) => {
+        if (!Array.isArray(calls) || !calls.length) return [];
+        setLogData((current) => {
+          const merged = mergeLogRecords(current, calls);
+          save("sgs_log", merged);
+          return merged;
+        });
+        return calls;
+      })
+      .catch(() => []);
+  }
+
+  function refreshServiceHealth() {
+    return fetchFmsHealth()
+      .then((health) => {
+        setServiceHealth({
+          status: health?.status || "unknown",
+          database: health?.database || "unknown"
+        });
+        return health;
+      })
+      .catch((error) => {
+        const data = error?.response?.data || {};
+        setServiceHealth({
+          status: data.status || (error?.response?.status === 503 ? "degraded" : "unknown"),
+          database: data.database || "unavailable"
+        });
+        return data;
+      });
+  }
+
+  function getPendingLogRecords(records = logData) {
+    return records.filter((record) => {
+      const hasSyncIdentity = Boolean(cleanText(record.clientRequestId || record.client_request_id) || cleanText(record.id));
+      return hasSyncIdentity && record.syncStatus === "pending";
+    });
+  }
+
+  function applyServerRecordToLocal(records, localRecord, serverRecord, syncAction = localRecord?.syncAction || "create") {
+    const nextRecord = normalizeLogRecord(
+      {
+        ...(localRecord || {}),
+        ...(serverRecord || {}),
+        id: serverRecord?.id ?? localRecord?.id ?? null,
+        clientRequestId: localRecord?.clientRequestId || serverRecord?.clientRequestId || serverRecord?.client_request_id || "",
+        syncStatus: "synced",
+        syncError: "",
+        syncAction: syncAction === "update" ? "update" : "synced"
+      },
+      { defaultSyncStatus: "synced" }
+    );
+
+    return records.map((record) => (sameLogRecord(record, localRecord) ? nextRecord : record));
+  }
+
+  function markRecordSyncError(records, targetRecord, message, syncStatus = "pending", syncAction = targetRecord?.syncAction || "create") {
+    return records.map((record) =>
+      sameLogRecord(record, targetRecord)
+        ? normalizeLogRecord(
+            {
+              ...record,
+              syncStatus,
+              syncError: message,
+              syncAction
+            },
+            { defaultSyncStatus: syncStatus }
+          )
+        : record
+    );
+  }
+
+  async function syncSingleRecord(record) {
+    const payload = buildSyncPayload(record);
+    if (record?.id && record.syncAction === "update") {
+      return updateFmsCallLog(record.id, payload);
+    }
+    return createFmsCallLog(payload);
+  }
+
+  const syncPendingCalls = useCallback(
+    async ({ silent = false } = {}) => {
+      const pendingRecords = getPendingLogRecords(logDataRef.current);
+      if (!pendingRecords.length) {
+        if (!silent) {
+          toast.success("No pending FMS calls to sync.");
+        }
+        return { synced: 0, pending: 0 };
+      }
+
+      if (typeof navigator !== "undefined" && navigator.onLine === false) {
+        if (!silent) {
+          toast.error("You are offline. Pending FMS calls will sync when the connection returns.");
+        }
+        return { synced: 0, pending: pendingRecords.length };
+      }
+
+      setIsSyncingPending(true);
+      try {
+        const health = await refreshServiceHealth();
+        if (health && health.database && health.database !== "ok") {
+          throw new Error(health.message || "Database is temporarily unavailable.");
+        }
+
+        let working = [...logDataRef.current];
+        let synced = 0;
+
+        for (const record of pendingRecords) {
+          let lastError = null;
+          let serverRecord = null;
+
+          for (let attempt = 0; attempt <= FMS_SYNC_RETRY_DELAYS_MS.length; attempt += 1) {
+            try {
+              serverRecord = await syncSingleRecord(record);
+              lastError = null;
+              break;
+            } catch (error) {
+              lastError = error;
+              if (attempt >= FMS_SYNC_RETRY_DELAYS_MS.length || !isRetryableSyncError(error)) {
+                break;
+              }
+              await wait(FMS_SYNC_RETRY_DELAYS_MS[attempt]);
+            }
+          }
+
+          if (serverRecord) {
+            working = applyServerRecordToLocal(working, record, serverRecord, record.syncAction || "create");
+            synced += 1;
+          } else if (lastError) {
+            const message = getApiErrorMessage(lastError, "Unable to sync pending FMS call.");
+            working = markRecordSyncError(
+              working,
+              record,
+              message,
+              isRetryableSyncError(lastError) ? "pending" : "error",
+              record.syncAction || "create"
+            );
+            if (!silent) {
+              toast.error(message);
+            }
+          }
+        }
+
+        const normalized = normalizeLogData(working, { defaultSyncStatus: "synced" });
+        setLogData(normalized);
+        save("sgs_log", normalized);
+        await refreshRemoteLogs();
+
+        if (!silent && synced > 0) {
+          toast.success(`Synced ${synced} pending FMS call${synced === 1 ? "" : "s"}.`);
+        }
+
+        return { synced, pending: pendingRecords.length - synced };
+      } catch (error) {
+        const message = getApiErrorMessage(error, "Unable to sync pending FMS calls.");
+        if (!silent) {
+          toast.error(message);
+        }
+        throw error;
+      } finally {
+        setIsSyncingPending(false);
+      }
+    },
+    []
+  );
+
+  function triggerImportDialog() {
+    if (importBusy) {
+      return;
+    }
+
+    if (!canImport) {
+      toast.error(importPermissionMessage);
+      return;
+    }
+
+    const input = importFileRef.current;
+    if (!input) {
+      toast.error("Import file picker is not available right now.");
+      return;
+    }
+
+    if (typeof input.showPicker === "function") {
+      input.showPicker();
+      return;
+    }
+
+    input.click();
+  }
+
+  async function handleImportFile(event) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+
+    if (!canImport) {
+      toast.error(importPermissionMessage);
+      return;
+    }
+
+    const name = file.name.toLowerCase();
+    const allowedTypes = [
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "application/vnd.ms-excel"
+    ];
+    if (!allowedTypes.includes(file.type) && !name.endsWith(".xlsx") && !name.endsWith(".xls")) {
+      toast.error("Please upload an .xlsx or .xls file.");
+      return;
+    }
+
+    const maxSizeBytes = 25 * 1024 * 1024;
+    if (file.size > maxSizeBytes) {
+      toast.error("File is too large. Please keep it under 25 MB.");
+      return;
+    }
+
+    setImportBusy(true);
+    setImportProgress(0);
+    setImportMessage("Reading workbook...");
+
+    try {
+      const { sheetName, rows } = await parseFmsImportWorkbook(file);
+      if (!rows.length) {
+        throw new Error("The uploaded sheet does not contain any records.");
+      }
+
+      const importKey = window.crypto?.randomUUID ? window.crypto.randomUUID() : `fms-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const chunkSize = 250;
+      const totalChunks = Math.ceil(rows.length / chunkSize);
+      let importedCount = 0;
+      let skippedCount = 0;
+      let failedCount = 0;
+
+      for (let index = 0; index < totalChunks; index += 1) {
+        const chunk = rows.slice(index * chunkSize, (index + 1) * chunkSize);
+        setImportMessage(`Uploading ${index + 1} of ${totalChunks} chunks from ${sheetName || "Sheet1"}...`);
+        const chunkResult = await uploadFmsImportChunk({
+          importKey,
+          fileName: file.name,
+          fileSizeBytes: file.size,
+          totalRows: rows.length,
+          rows: chunk,
+          isLast: index === totalChunks - 1
+        });
+        importedCount += chunkResult.importedCount || 0;
+        skippedCount += chunkResult.skippedCount || 0;
+        failedCount += chunkResult.failedCount || 0;
+        setImportProgress(Math.round(((index + 1) / totalChunks) * 100));
+      }
+
+      await Promise.all([refreshRemoteLogs(), refreshHistory()]);
+      const summaryMessage = `Imported ${importedCount} rows, skipped ${skippedCount}, failed ${failedCount}.`;
+      if (failedCount > 0) {
+        toast.error(summaryMessage);
+      } else {
+        toast.success(summaryMessage);
+      }
+      setImportMessage(summaryMessage);
+    } catch (error) {
+      await Promise.all([refreshRemoteLogs(), refreshHistory()]).catch(() => {});
+      const message = error?.response?.data?.message || error?.response?.data?.error || error.message || "Import failed";
+      toast.error(message);
+      setImportMessage(message);
+    } finally {
+      setImportBusy(false);
+    }
+  }
+
+  async function rollbackLastImportBatch() {
+    if (!canImport) {
+      toast.error("Only Admin and Supervisor roles can roll back imports.");
+      return;
+    }
+    if (!window.confirm("Rollback the last import batch? This will remove the imported call log rows.")) {
+      return;
+    }
+
+    try {
+      const result = await rollbackLastFmsImport();
+      await Promise.all([refreshRemoteLogs(), refreshHistory()]);
+      toast.success(`Rolled back ${result.deletedRows || 0} imported records.`);
+    } catch (error) {
+      toast.error(error?.response?.data?.message || "Unable to roll back the last import.");
+    }
+  }
+
+  async function downloadErrorLog(importBatch) {
+    try {
+      const errors = await fetchFmsImportErrors(importBatch.id);
+      if (!errors.length) {
+        toast("No error rows found for this batch.");
+        return;
+      }
+
+      const headers = ["Row Number", "Incident No", "Error Message", "Raw Row"];
+      const csvRows = [headers.join(",")];
+      errors.forEach((row) => {
+        csvRows.push(
+          [
+            row.rowNumber,
+            JSON.stringify(row.incidentNo || ""),
+            JSON.stringify(row.errorMessage || ""),
+            JSON.stringify(row.rowData || {})
+          ].join(",")
+        );
+      });
+
+      const blob = new Blob([csvRows.join("\n")], { type: "text/csv;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `FMS_Import_Errors_${importBatch.id}.csv`;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      toast.error(error?.response?.data?.message || "Unable to download the error log.");
+    }
+  }
+
   function openLogModal(idx = -1) {
     setLogModal({ open: true, idx });
     if (idx >= 0) setLogForm({ ...defaultLogForm, ...logData[idx] });
     else setLogForm({ ...defaultLogForm, incidentNo: genIncNo(logData) });
   }
 
-  function saveLogRecord() {
+  async function saveLogRecord() {
+    const normalized = normalizeLogRecord(logForm, { defaultSyncStatus: "pending" });
+    const validationErrors = validateLogRecord(normalized);
+    if (validationErrors.length) {
+      toast.error(`Please complete: ${validationErrors.join(", ")}.`);
+      return;
+    }
+
+    const existing = logModal.idx >= 0 ? logData[logModal.idx] : null;
+    const clientRequestId = existing?.clientRequestId || createClientRequestId();
+    const syncAction = existing?.id ? "update" : "create";
+    const optimisticRecord = normalizeLogRecord(
+      {
+        ...normalized,
+        id: existing?.id || null,
+        clientRequestId,
+        syncStatus: "pending",
+        syncError: "",
+        syncAction
+      },
+      { defaultSyncStatus: "pending" }
+    );
     const next = [...logData];
-    if (logModal.idx >= 0) next[logModal.idx] = { ...logForm };
-    else next.push({ ...logForm });
-    setLogData(next);
-    save("sgs_log", next);
-    setLogModal({ open: false, idx: -1 });
+    if (logModal.idx >= 0 && existing) {
+      next[logModal.idx] = mergeLogRecord(existing, optimisticRecord);
+    } else {
+      next.unshift(optimisticRecord);
+    }
+    const normalizedLocal = normalizeLogData(next, { defaultSyncStatus: "synced" });
+    setLogData(normalizedLocal);
+    save("sgs_log", normalizedLocal);
+    setIsSavingLog(true);
+
+    try {
+      if (typeof navigator !== "undefined" && navigator.onLine === false) {
+        throw new Error("You are offline right now.");
+      }
+      const health = await refreshServiceHealth();
+      if (health?.database && health.database !== "ok") {
+        throw new Error(health.message || "Database is temporarily unavailable.");
+      }
+
+      const payload = buildSyncPayload(optimisticRecord);
+      const serverCall = existing?.id ? await updateFmsCallLog(existing.id, payload) : await createFmsCallLog(payload);
+      const synced = normalizeLogData(
+        normalizedLocal.map((record) =>
+          sameLogRecord(record, optimisticRecord)
+            ? normalizeLogRecord(
+                {
+                  ...record,
+                  ...serverCall,
+                  id: serverCall?.id ?? record.id ?? null,
+                  clientRequestId: record.clientRequestId || clientRequestId,
+                  syncStatus: "synced",
+                  syncError: "",
+                  syncAction: "synced"
+                },
+                { defaultSyncStatus: "synced" }
+              )
+            : record
+        ),
+        { defaultSyncStatus: "synced" }
+      );
+      setLogData(synced);
+      save("sgs_log", synced);
+      await refreshRemoteLogs();
+      toast.success("Call record saved to the server.");
+      setLogModal({ open: false, idx: -1 });
+    } catch (error) {
+      const retryable = isRetryableSyncError(error);
+      const message = getApiErrorMessage(error, "Unable to save the call to the server.");
+      const queued = markRecordSyncError(normalizedLocal, optimisticRecord, message, retryable ? "pending" : "error", syncAction);
+      setLogData(queued);
+      save("sgs_log", queued);
+      console.error("FMS call save failed:", {
+        message,
+        status: error?.response?.status,
+        code: error?.code,
+        retryable,
+        incidentNo: optimisticRecord.incidentNo,
+        clientRequestId: optimisticRecord.clientRequestId
+      });
+      toast.error(retryable ? `${message} The call is queued for automatic retry.` : message);
+      if (retryable) {
+        setLogModal({ open: false, idx: -1 });
+      }
+    } finally {
+      setIsSavingLog(false);
+    }
   }
 
   function removeLog(idx) {
-    if (!window.confirm("Delete this record?")) return;
-    const next = logData.filter((_, i) => i !== idx);
-    setLogData(next);
-    save("sgs_log", next);
+    const record = logData[idx];
+    if (!record) return;
+    const key = logSelectionKeyForRow({ ...record, __idx: idx });
+    deleteLogEntries([key]).catch(() => {});
   }
 
   function openPM(idx = -1) {
@@ -864,8 +1976,12 @@ export default function FMSModule() {
       "Area",
       "Machine",
       "Asset No",
+      "Equipment Name",
+      "Assets / Non Assets",
+      "Nature of Call",
       "Type",
       "Category",
+      "Equipment (Materials)",
       "Root Cause",
       "Repeated",
       "Reported By",
@@ -889,8 +2005,12 @@ export default function FMSModule() {
       r.area,
       r.machine,
       r.assetNo,
+      r.equipmentName,
+      r.assetNonAsset,
+      r.natureOfCall,
       r.assetType,
       r.callCategory,
+      r.equipment,
       r.rootCause,
       r.repeated,
       r.reportedBy,
@@ -900,9 +2020,9 @@ export default function FMSModule() {
       (r.actionTaken || "").replace(/,/g, ";"),
       r.status,
       r.closedDate,
-      calcMinutes(r.callOpenDate, r.attendDate),
-      calcMinutes(r.attendDate, r.closedDate),
-      calcMinutes(r.callOpenDate, r.closedDate),
+      getTimingValue(r, "responseMinutes", "callOpenDate", "attendDate"),
+      getTimingValue(r, "resolutionMinutes", "attendDate", "closedDate"),
+      getTimingValue(r, "downtimeMinutes", "callOpenDate", "closedDate"),
       r.pendingSide,
       r.remarks
     ]);
@@ -929,6 +2049,26 @@ export default function FMSModule() {
 
   return (
     <div className="fms-root">
+      <Toaster position="top-right" />
+      <input
+        ref={importFileRef}
+        type="file"
+        accept=".xlsx,.xls"
+        tabIndex={-1}
+        aria-hidden="true"
+        style={{
+          position: "absolute",
+          width: 1,
+          height: 1,
+          padding: 0,
+          margin: -1,
+          overflow: "hidden",
+          clip: "rect(0, 0, 0, 0)",
+          whiteSpace: "nowrap",
+          border: 0
+        }}
+        onChange={handleImportFile}
+      />
       <header
         style={{
           background: "linear-gradient(135deg,#0d1b3e 0%,#1a237e 60%,#1565c0 100%)",
@@ -960,6 +2100,7 @@ export default function FMSModule() {
           {[
             { key: "dashboard", label: "📊 Dashboard" },
             { key: "logdata", label: "📋 Log Data" },
+            ...(canImport ? [{ key: "imports", label: "📥 Import History" }] : []),
             { key: "pmlog", label: "🔧 PM Log" },
             { key: "imgbackup", label: "💾 Image Backup" },
             { key: "antivirus", label: "🛡️ Anti Virus" },
@@ -974,50 +2115,82 @@ export default function FMSModule() {
       </header>
 
       <div className={`tab-content ${activeTab === "dashboard" ? "active" : ""}`}>
+        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, flexWrap: "wrap", marginBottom: 14 }}>
+          <div>
+            <div style={{ fontSize: 12, fontWeight: 700, letterSpacing: 1.4, color: "#64748b", textTransform: "uppercase" }}>Dashboard time range</div>
+            <div style={{ fontSize: 13, color: "#475569", marginTop: 4 }}>Showing {dashboardPeriodLabel} performance across all charts.</div>
+          </div>
+          <div role="tablist" aria-label="Dashboard time range" style={{ display: "inline-flex", borderRadius: 999, overflow: "hidden", border: "1px solid #dbe4f0", background: "#fff", boxShadow: "0 8px 20px rgba(15, 23, 42, 0.08)" }}>
+            {DASHBOARD_TIME_RANGE_OPTIONS.map((option) => {
+              const selected = dashboardTimeRange === option.key;
+              return (
+                <button
+                  key={option.key}
+                  type="button"
+                  aria-pressed={selected}
+                  onClick={() => setDashboardTimeRange(option.key)}
+                  style={{
+                    border: "none",
+                    padding: "10px 16px",
+                    minWidth: 96,
+                    background: selected ? "linear-gradient(135deg,#1565c0,#0b57a6)" : "transparent",
+                    color: selected ? "#fff" : "#334155",
+                    fontFamily: "IBM Plex Sans,sans-serif",
+                    fontSize: 13,
+                    fontWeight: 700,
+                    cursor: "pointer"
+                  }}
+                >
+                  {option.label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
         <div className="kpi-grid">
-          <div className="kpi-card"><div className="kpi-label">Total Calls Logged</div><div className="kpi-value">{logData.length}</div><div className="kpi-sub">All incidents</div></div>
-          <div className="kpi-card red"><div className="kpi-label">Open Calls</div><div className="kpi-value" style={{ color: "var(--red)" }}>{openCalls}</div><div className="kpi-sub">Pending resolution</div></div>
-          <div className="kpi-card green"><div className="kpi-label">Closed Calls</div><div className="kpi-value" style={{ color: "var(--green)" }}>{closedCalls}</div><div className="kpi-sub">Resolved</div></div>
-          <div className="kpi-card orange"><div className="kpi-label">Calls On Hold</div><div className="kpi-value" style={{ color: "var(--orange)" }}>{holdCalls}</div><div className="kpi-sub">Awaiting action</div></div>
-          <div className="kpi-card accent"><div className="kpi-label">Avg MTTR (Min)</div><div className="kpi-value" style={{ color: "var(--accent2)" }}>{avgMTTR}</div><div className="kpi-sub">Mean time to repair</div></div>
-          <div className="kpi-card"><div className="kpi-label">Total Downtime (Min)</div><div className="kpi-value">{totalDownMinutes}</div><div className="kpi-sub">Cumulative downtime</div></div>
+          <div className="kpi-card"><div className="kpi-label">Total Calls Logged</div><div className="kpi-value">{dashboardFilteredLogs.length}</div><div className="kpi-sub">{dashboardPeriodLabel} incidents</div></div>
+          <div className="kpi-card red"><div className="kpi-label">Open Calls</div><div className="kpi-value" style={{ color: "var(--red)" }}>{dashboardOpenCalls}</div><div className="kpi-sub">Pending resolution</div></div>
+          <div className="kpi-card green"><div className="kpi-label">Closed Calls</div><div className="kpi-value" style={{ color: "var(--green)" }}>{dashboardClosedCalls}</div><div className="kpi-sub">Resolved</div></div>
+          <div className="kpi-card orange"><div className="kpi-label">Calls On Hold</div><div className="kpi-value" style={{ color: "var(--orange)" }}>{dashboardHoldCalls}</div><div className="kpi-sub">Awaiting action</div></div>
+          <div className="kpi-card accent"><div className="kpi-label">Avg MTTR (Min)</div><div className="kpi-value" style={{ color: "var(--accent2)" }}>{dashboardAvgMTTR}</div><div className="kpi-sub">Mean time to repair</div></div>
+          <div className="kpi-card"><div className="kpi-label">Total Downtime (Min)</div><div className="kpi-value">{dashboardTotalDownMinutes}</div><div className="kpi-sub">Cumulative downtime</div></div>
         </div>
 
         <div className="chart-grid">
           <div className="chart-card">
             <div className="chart-title">Pareto Analysis — Average Downtime MTTR (Min) by Division</div>
             <div className="chart-wrap">
-              <Bar data={{ labels: [...DIVISIONS].sort((a, b) => divisionAvgDown[b] - divisionAvgDown[a]), datasets: [{ label: "Avg MTTR (Min)", data: [...DIVISIONS].sort((a, b) => divisionAvgDown[b] - divisionAvgDown[a]).map((d) => divisionAvgDown[d]), backgroundColor: COLORS }] }} options={baseBarOptions} />
+              <Bar data={{ labels: [...dashboardDivisionOptions].sort((a, b) => (dashboardDivisionAvgDown[b] || 0) - (dashboardDivisionAvgDown[a] || 0)), datasets: [{ label: "Avg MTTR (Min)", data: [...dashboardDivisionOptions].sort((a, b) => (dashboardDivisionAvgDown[b] || 0) - (dashboardDivisionAvgDown[a] || 0)).map((division) => dashboardDivisionAvgDown[division] || 0), backgroundColor: COLORS }] }} options={baseBarOptions} />
             </div>
           </div>
           <div className="chart-card">
             <div className="chart-title">Waterfall — Number of PC Breakdowns by Division</div>
             <div className="chart-wrap">
-              <Bar data={{ labels: DIVISIONS, datasets: [{ label: "Breakdowns", data: DIVISIONS.map((d) => divisionCounts[d]), backgroundColor: COLORS }] }} options={baseBarOptions} />
+              <Bar data={{ labels: dashboardDivisionOptions, datasets: [{ label: "Breakdowns", data: dashboardDivisionOptions.map((division) => dashboardDivisionCounts[division] || 0), backgroundColor: COLORS }] }} options={baseBarOptions} />
             </div>
           </div>
           <div className="chart-card">
             <div className="chart-title">Total PC Downtime (Min) by Division</div>
             <div className="chart-wrap">
-              <Doughnut data={{ labels: DIVISIONS, datasets: [{ data: DIVISIONS.map((d) => divisionDowntime[d]), backgroundColor: COLORS }] }} options={pieOptions} />
+              <Doughnut data={{ labels: dashboardDivisionOptions, datasets: [{ data: dashboardDivisionOptions.map((division) => dashboardDivisionDowntime[division] || 0), backgroundColor: COLORS }] }} options={pieOptions} />
             </div>
           </div>
           <div className="chart-card">
             <div className="chart-title">Breakdown by Call Category</div>
             <div className="chart-wrap">
-              <Bar data={{ labels: CALL_CATEGORIES, datasets: [{ label: "Count", data: CALL_CATEGORIES.map((c) => logData.filter((r) => r.callCategory === c).length), backgroundColor: COLORS }] }} options={baseBarOptions} />
+              <Bar data={{ labels: dashboardCallCategoryOptions, datasets: [{ label: "Count", data: dashboardCallCategoryCounts, backgroundColor: COLORS }] }} options={baseBarOptions} />
             </div>
           </div>
           <div className="chart-card">
             <div className="chart-title">Breakdown by Type of Assets</div>
             <div className="chart-wrap">
-              <Bar data={{ labels: assetTypeFiltered.map((x) => x.t), datasets: [{ label: "Count", data: assetTypeFiltered.map((x) => x.c), backgroundColor: COLORS }] }} options={baseBarOptions} />
+              <Bar data={{ labels: dashboardAssetTypeFiltered.map((x) => x.t), datasets: [{ label: "Count", data: dashboardAssetTypeFiltered.map((x) => x.c), backgroundColor: COLORS }] }} options={baseBarOptions} />
             </div>
           </div>
           <div className="chart-card">
-            <div className="chart-title">Monthly Call Volume Trend</div>
+            <div className="chart-title">{dashboardPeriodLabel} Call Volume Trend</div>
             <div className="chart-wrap">
-              <Line data={{ labels: monthLabels, datasets: [{ label: "Calls", data: monthLabels.map((m) => monthMap[m]), borderColor: "#1565c0", backgroundColor: "rgba(21,101,192,0.1)", fill: true, tension: 0.4, pointRadius: 3 }] }} options={baseBarOptions} />
+              <Line data={{ labels: dashboardMonthSeries.map((entry) => entry.label), datasets: [{ label: "Calls", data: dashboardMonthSeries.map((entry) => entry.value), borderColor: "#1565c0", backgroundColor: "rgba(21,101,192,0.1)", fill: true, tension: 0.4, pointRadius: 3 }] }} options={baseBarOptions} />
             </div>
           </div>
           <div className="chart-card" style={{ gridColumn: "1 / -1" }}>
@@ -1025,11 +2198,11 @@ export default function FMSModule() {
             <div className="chart-wrap" style={{ height: 250 }}>
               <Bar
                 data={{
-                  labels: DIVISIONS,
+                  labels: dashboardDivisionOptions,
                   datasets: [
-                    { label: "OPEN", data: statusByDivision.OPEN, backgroundColor: "#c62828" },
-                    { label: "CLOSED", data: statusByDivision.CLOSED, backgroundColor: "#2e7d32" },
-                    { label: "HOLD", data: statusByDivision.HOLD, backgroundColor: "#e65100" }
+                    { label: "OPEN", data: dashboardStatusByDivision.OPEN, backgroundColor: "#c62828" },
+                    { label: "CLOSED", data: dashboardStatusByDivision.CLOSED, backgroundColor: "#2e7d32" },
+                    { label: "HOLD", data: dashboardStatusByDivision.HOLD, backgroundColor: "#e65100" }
                   ]
                 }}
                 options={{ responsive: true, maintainAspectRatio: false, plugins: { legend: { position: "top", labels: { font: { size: 10 }, boxWidth: 12 } } }, scales: { x: { stacked: true, ticks: { font: { size: 9 } } }, y: { stacked: true, ticks: { font: { size: 9 } } } } }}
@@ -1043,31 +2216,114 @@ export default function FMSModule() {
         <div className="section-title">📋 P.C. MAINT BREAK DOWN REPORT — Call Log</div>
         <div className="toolbar">
           <select value={logFilter.month} onChange={(e) => setLogFilter((p) => ({ ...p, month: e.target.value }))}><option value="">All Months</option>{uniqueMonths.map((m) => <option key={m}>{m}</option>)}</select>
-          <select value={logFilter.division} onChange={(e) => setLogFilter((p) => ({ ...p, division: e.target.value }))}><option value="">All Divisions</option>{DIVISIONS.map((d) => <option key={d}>{d}</option>)}</select>
-          <select value={logFilter.area} onChange={(e) => setLogFilter((p) => ({ ...p, area: e.target.value }))}><option value="">All Areas</option>{(AREAS[logFilter.division] || []).map((a) => <option key={a}>{a}</option>)}</select>
+          <select value={logFilter.division} onChange={(e) => setLogFilter((p) => ({ ...p, division: e.target.value }))}><option value="">All Divisions</option>{logDivisionOptions.map((division) => <option key={division}>{division}</option>)}</select>
+          <select value={logFilter.area} onChange={(e) => setLogFilter((p) => ({ ...p, area: e.target.value }))}><option value="">All Areas</option>{logAreaOptions.map((area) => <option key={area}>{area}</option>)}</select>
           <select value={logFilter.status} onChange={(e) => setLogFilter((p) => ({ ...p, status: e.target.value }))}><option value="">All Status</option><option>OPEN</option><option>CLOSED</option><option>HOLD</option></select>
-          <select value={logFilter.assettype} onChange={(e) => setLogFilter((p) => ({ ...p, assettype: e.target.value }))}><option value="">All Asset Types</option>{ASSET_TYPES.map((t) => <option key={t}>{t}</option>)}</select>
-          <select value={logFilter.category} onChange={(e) => setLogFilter((p) => ({ ...p, category: e.target.value }))}><option value="">All Categories</option>{CALL_CATEGORIES.map((c) => <option key={c}>{c}</option>)}</select>
+          <select value={logFilter.assettype} onChange={(e) => setLogFilter((p) => ({ ...p, assettype: e.target.value }))}><option value="">All Asset Types</option>{logAssetTypeOptions.map((assetType) => <option key={assetType}>{assetType}</option>)}</select>
+          <select value={logFilter.category} onChange={(e) => setLogFilter((p) => ({ ...p, category: e.target.value }))}><option value="">All Categories</option>{logCallCategoryOptions.map((category) => <option key={category}>{category}</option>)}</select>
           <input type="text" value={logFilter.search} onChange={(e) => setLogFilter((p) => ({ ...p, search: e.target.value }))} placeholder="🔍 Search Incident No / Machine / Description..." />
           <span className="toolbar-spacer" />
           <button type="button" className="btn btn-success" onClick={exportCSV}>⬇ Export CSV</button>
+          <button type="button" className="btn btn-outline" onClick={() => downloadSampleFmsWorkbook()}>Download Sample Excel</button>
+          <button
+            type="button"
+            className="btn btn-primary"
+            onClick={triggerImportDialog}
+            disabled={importBusy}
+            title={!canImport ? importPermissionMessage : "Import an Excel workbook"}
+            aria-disabled={!canImport || importBusy}
+          >
+            {importBusy ? "Importing..." : "Import Excel"}
+          </button>
+          {canImport ? (
+            <button type="button" className="btn btn-outline" onClick={rollbackLastImportBatch} disabled={importBusy}>
+              Rollback Last Import
+            </button>
+          ) : null}
+          {canManage && selectedLogCount ? (
+            <>
+              <span style={{ fontSize: 12, color: "var(--blue2)", fontWeight: 600, padding: "6px 10px", borderRadius: 999, background: "#e8f1ff" }}>
+                {selectedLogCount} selected
+              </span>
+              <button type="button" className="btn btn-danger" onClick={() => deleteLogEntries().catch(() => {})} disabled={isDeletingLog || isSavingLog}>
+                {isDeletingLog ? "Deleting..." : `Delete Selected${selectedLogCount ? ` (${selectedLogCount})` : ""}`}
+              </button>
+              <button type="button" className="btn btn-outline" onClick={clearSelectedLogs} disabled={isDeletingLog || isSavingLog}>
+                Clear Selection
+              </button>
+            </>
+          ) : null}
+          <span
+            style={{
+              fontSize: 12,
+              color: isOnline ? "var(--green)" : "var(--orange)",
+              fontWeight: 700,
+              padding: "6px 10px",
+              borderRadius: 999,
+              background: isOnline ? "#e8f5e9" : "#fff3e0"
+            }}
+          >
+            {isOnline ? `Online | DB ${serviceHealth.database === "ok" ? "ready" : "checking"}` : "Offline"}
+          </span>
+          <button
+            type="button"
+            className="btn btn-outline"
+            onClick={() => syncPendingCalls().catch(() => {})}
+            disabled={isSyncingPending || pendingSyncCount === 0}
+          >
+            {isSyncingPending ? "Syncing..." : `Sync Pending Calls${pendingSyncCount ? ` (${pendingSyncCount})` : ""}`}
+          </button>
           {canManage ? <button type="button" className="btn btn-primary" onClick={() => openLogModal()}>+ Add New Call</button> : null}
         </div>
+        {importBusy || importMessage ? (
+          <div style={{ marginBottom: 14, padding: "10px 12px", border: "1px solid #dbeafe", borderRadius: 10, background: "#eff6ff" }}>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginBottom: 8, fontSize: 12, color: "#1d4ed8", fontWeight: 600 }}>
+              <span>{importMessage || "Import ready."}</span>
+              <span>{importProgress}%</span>
+            </div>
+            <div style={{ height: 10, borderRadius: 999, background: "#dbeafe", overflow: "hidden" }}>
+              <div style={{ width: `${importProgress}%`, height: "100%", borderRadius: 999, background: "linear-gradient(90deg,#1d4ed8,#10b981)", transition: "width 180ms ease" }} />
+            </div>
+          </div>
+        ) : null}
         <div className="table-wrap">
           <div className="table-scroll">
             <table id="logTable">
               <thead>
                 <tr>
+                  {canManage ? (
+                    <th style={{ width: 44, textAlign: "center" }}>
+                      <input
+                        ref={selectAllLogRef}
+                        type="checkbox"
+                        aria-label="Select all call logs"
+                        checked={allFilteredLogsSelected}
+                        onChange={(e) => toggleAllFilteredLogs(e.target.checked)}
+                        style={{ width: 16, height: 16, cursor: "pointer" }}
+                      />
+                    </th>
+                  ) : null}
                   <th onClick={() => sortLog("incidentNo")}>INC NO ↕</th><th onClick={() => sortLog("month")}>MONTH ↕</th><th onClick={() => sortLog("callOpenDate")}>CALL OPEN DATE/TIME ↕</th>
-                  <th onClick={() => sortLog("division")}>DIVISION ↕</th><th>AREA</th><th>MACHINE</th><th>ASSET NO</th><th>ASSET/NON-ASSET</th>
-                  <th>TYPE OF ASSETS</th><th>CALL CATEGORY</th><th>ROOT CAUSE</th><th>REPEATED</th><th>REPORTED BY</th><th>DESCRIPTION</th><th>ATTENDED BY</th>
-                  <th>ATTEND DATE/TIME</th><th>ACTION TAKEN</th><th onClick={() => sortLog("status")}>STATUS ↕</th><th>CLOSED DATE/TIME</th><th>RESPONSE(Min)</th>
+                  <th onClick={() => sortLog("division")}>DIVISION ?</th><th>AREA</th><th>MACHINE</th><th>ASSET NO</th><th>EQUIPMENT NAME</th><th>ASSET/NON-ASSET</th>
+                  <th>NATURE OF CALL</th><th>TYPE OF ASSETS</th><th>CALL CATEGORY</th><th>EQUIPMENT (MAT.)</th><th>REPEATED</th><th>REPORTED BY</th><th>DESCRIPTION</th><th>ATTENDED BY</th>
+                  <th>ATTEND DATE/TIME</th><th>ACTION TAKEN</th><th onClick={() => sortLog("status")}>STATUS ?</th><th>CLOSED DATE/TIME</th><th>RESPONSE(Min)</th>
                   <th>RESOLUTION(Min)</th><th>DOWNTIME(Min)</th><th>PENDING SIDE</th><th>REMARKS</th>{canManage ? <th>ACTIONS</th> : null}
                 </tr>
               </thead>
               <tbody>
                 {pagedLog.map((r) => (
                   <tr key={`${r.incidentNo}-${r.__idx}`}>
+                    {canManage ? (
+                      <td style={{ textAlign: "center" }}>
+                        <input
+                          type="checkbox"
+                          aria-label={`Select call log ${r.incidentNo || ""}`}
+                          checked={selectedLogKeySet.has(logSelectionKeyForRow(r))}
+                          onChange={() => toggleLogSelection(logSelectionKeyForRow(r))}
+                          style={{ width: 16, height: 16, cursor: "pointer" }}
+                        />
+                      </td>
+                    ) : null}
                     <td><span style={{ fontFamily: "IBM Plex Mono", fontSize: 11, color: "var(--blue2)" }}>{r.incidentNo}</span></td>
                     <td>{r.month || ""}</td>
                     <td style={{ whiteSpace: "nowrap", fontSize: 11 }}>{fmtDT(r.callOpenDate)}</td>
@@ -1075,35 +2331,120 @@ export default function FMSModule() {
                     <td>{r.area || ""}</td>
                     <td className="td-truncate">{r.machine || ""}</td>
                     <td style={{ fontFamily: "IBM Plex Mono", fontSize: 10 }}>{r.assetNo || ""}</td>
+                    <td className="td-truncate">{r.equipmentName || ""}</td>
                     <td>{r.assetNonAsset || ""}</td>
+                    <td className="td-truncate">{r.natureOfCall || ""}</td>
                     <td style={{ fontSize: 10 }}>{r.assetType || ""}</td>
                     <td>{r.callCategory || ""}</td>
-                    <td>{r.rootCause || ""}</td>
-                    <td><span className={`badge ${r.repeated === "YES" ? "badge-notdone" : "badge-done"}`}>{r.repeated || ""}</span></td>
+                    <td className="td-truncate">{r.equipment || ""}</td>
+                    <td><span className={`badge ${sameValue(r.repeated, "YES") ? "badge-notdone" : "badge-done"}`}>{r.repeated || ""}</span></td>
                     <td>{r.reportedBy || ""}</td>
                     <td style={{ maxWidth: 260, whiteSpace: "normal", wordBreak: "break-word" }}>{r.description || ""}</td>
                     <td style={{ whiteSpace: "nowrap", fontSize: 11 }}>{r.attendedBy || ""}</td>
                     <td style={{ whiteSpace: "nowrap", fontSize: 11 }}>{fmtDT(r.attendDate)}</td>
                     <td style={{ maxWidth: 260, whiteSpace: "normal", wordBreak: "break-word" }}>{r.actionTaken || ""}</td>
-                    <td><span className={`badge ${statusBadgeClass(r.status)}`}>{r.status || ""}</span></td>
+                    <td>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 4, alignItems: "flex-start" }}>
+                        <span className={`badge ${statusBadgeClass(r.status)}`}>{r.status || ""}</span>
+                        {r.syncStatus === "pending" ? (
+                          <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: 0.5, color: "var(--orange)" }}>SYNC PENDING</span>
+                        ) : null}
+                        {r.syncStatus === "error" ? (
+                          <span title={r.syncError || ""} style={{ fontSize: 10, fontWeight: 700, letterSpacing: 0.5, color: "var(--red)" }}>
+                            SYNC ERROR
+                          </span>
+                        ) : null}
+                      </div>
+                    </td>
                     <td style={{ whiteSpace: "nowrap", fontSize: 11 }}>{fmtDT(r.closedDate)}</td>
-                    <td style={{ textAlign: "center", fontWeight: 600 }}>{calcMinutes(r.callOpenDate, r.attendDate)}</td>
-                    <td style={{ textAlign: "center", fontWeight: 600 }}>{calcMinutes(r.attendDate, r.closedDate)}</td>
-                    <td style={{ textAlign: "center", fontWeight: 600, color: "var(--red)" }}>{calcMinutes(r.callOpenDate, r.closedDate)}</td>
+                    <td style={{ textAlign: "center", fontWeight: 600 }}>{getTimingValue(r, "responseMinutes", "callOpenDate", "attendDate")}</td>
+                    <td style={{ textAlign: "center", fontWeight: 600 }}>{getTimingValue(r, "resolutionMinutes", "attendDate", "closedDate")}</td>
+                    <td style={{ textAlign: "center", fontWeight: 600, color: "var(--red)" }}>{getTimingValue(r, "downtimeMinutes", "callOpenDate", "closedDate")}</td>
                     <td>{r.pendingSide || ""}</td>
                     <td style={{ maxWidth: 260, whiteSpace: "normal", wordBreak: "break-word" }}>{r.remarks || ""}</td>
                     {canManage ? (
                       <td style={{ whiteSpace: "nowrap" }}>
-                        <button type="button" className="btn btn-outline btn-sm" onClick={() => openLogModal(r.__idx)}>✎</button>
-                        <button type="button" className="btn btn-danger btn-sm" style={{ marginLeft: 4 }} onClick={() => removeLog(r.__idx)}>🗑</button>
+                        <button type="button" className="btn btn-outline btn-sm" onClick={() => openLogModal(r.__idx)} disabled={Boolean(r.importBatchId) || isSavingLog || isDeletingLog} title={r.importBatchId ? "Imported rows are managed through rollback" : "Edit"}>
+                          ✎
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-danger btn-sm"
+                          style={{ marginLeft: 4 }}
+                          onClick={() => removeLog(r.__idx)}
+                          disabled={Boolean(r.importBatchId) || isSavingLog || isDeletingLog}
+                          title={r.importBatchId ? "Imported rows are managed through rollback" : "Delete"}
+                        >
+                          🗑
+                        </button>
                       </td>
                     ) : null}
                   </tr>
                 ))}
+                {!busy && !pagedLog.length ? <tr><td colSpan={27 + (canManage ? 1 : 0)} className="py-6 text-center text-slate-500">No call records</td></tr> : null}
               </tbody>
             </table>
           </div>
           <Pagination total={logFiltered.length} currentPage={logPage} onPageChange={setLogPage} />
+        </div>
+      </div>
+
+      <div className={`tab-content ${activeTab === "imports" ? "active" : ""}`}>
+        <div className="section-title">📥 Import History</div>
+        <div className="toolbar">
+          <span style={{ fontSize: 13, color: "var(--text3)" }}>Review uploaded files, totals, and rollback status.</span>
+          <span className="toolbar-spacer" />
+          <button type="button" className="btn btn-outline" onClick={refreshHistory}>Refresh</button>
+          {canImport ? (
+            <button type="button" className="btn btn-primary" onClick={rollbackLastImportBatch}>
+              Rollback Last Import
+            </button>
+          ) : null}
+        </div>
+        <div className="table-wrap">
+          <div className="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>UPLOADED AT</th>
+                  <th>FILE NAME</th>
+                  <th>UPLOADER</th>
+                  <th>TOTAL</th>
+                  <th>IMPORTED</th>
+                  <th>SKIPPED</th>
+                  <th>FAILED</th>
+                  <th>STATUS</th>
+                  <th>ROLLED BACK</th>
+                  <th>ACTIONS</th>
+                </tr>
+              </thead>
+              <tbody>
+                {importHistory.map((item) => (
+                  <tr key={item.id}>
+                    <td style={{ whiteSpace: "nowrap", fontSize: 11 }}>{fmtDT(item.uploadedAt)}</td>
+                    <td className="td-truncate">{item.fileName}</td>
+                    <td>{item.uploaderName || "-"}</td>
+                    <td style={{ textAlign: "center" }}>{item.totalRows}</td>
+                    <td style={{ textAlign: "center" }}>{item.importedRows}</td>
+                    <td style={{ textAlign: "center" }}>{item.skippedRows}</td>
+                    <td style={{ textAlign: "center" }}>{item.failedRows}</td>
+                    <td><span className={`badge ${item.status === "rolled_back" ? "badge-notdone" : item.failedRows ? "badge-hold" : "badge-done"}`}>{item.status}</span></td>
+                    <td>{item.rolledBackAt ? fmtDT(item.rolledBackAt) : "-"}</td>
+                    <td style={{ whiteSpace: "nowrap" }}>
+                      <button type="button" className="btn btn-outline btn-sm" onClick={() => downloadErrorLog(item)} disabled={!item.failedRows}>
+                        Error Log
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+                {!importHistory.length ? (
+                  <tr>
+                    <td colSpan={10} className="py-6 text-center text-slate-500">No import history yet.</td>
+                  </tr>
+                ) : null}
+              </tbody>
+            </table>
+          </div>
         </div>
       </div>
 
@@ -1203,8 +2544,8 @@ export default function FMSModule() {
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, marginBottom: 20 }}>
           <div className="chart-card"><div className="chart-title">Breakdowns per Division</div><div className="chart-wrap"><Bar data={{ labels: analysisRows.map((r) => r.division), datasets: [{ label: "Breakdowns", data: analysisRows.map((r) => r.cnt), backgroundColor: COLORS }] }} options={baseBarOptions} /></div></div>
           <div className="chart-card"><div className="chart-title">Average Downtime per Division (Pareto)</div><div className="chart-wrap"><Bar data={{ labels: [...analysisRows].sort((a, b) => b.avg - a.avg).map((r) => r.division), datasets: [{ label: "Avg Downtime (Min)", data: [...analysisRows].sort((a, b) => b.avg - a.avg).map((r) => r.avg), backgroundColor: COLORS }] }} options={baseBarOptions} /></div></div>
-          <div className="chart-card"><div className="chart-title">Breakdown by Root Cause</div><div className="chart-wrap"><Pie data={{ labels: ROOT_CAUSES, datasets: [{ data: ROOT_CAUSES.map((rc) => logData.filter((d) => d.rootCause === rc).length), backgroundColor: COLORS }] }} options={pieOptions} /></div></div>
-          <div className="chart-card"><div className="chart-title">Breakdown by Call Category</div><div className="chart-wrap"><Pie data={{ labels: CALL_CATEGORIES, datasets: [{ data: CALL_CATEGORIES.map((c) => logData.filter((d) => d.callCategory === c).length), backgroundColor: COLORS }] }} options={pieOptions} /></div></div>
+          <div className="chart-card"><div className="chart-title">Breakdown by Nature of Call</div><div className="chart-wrap"><Pie data={{ labels: logNatureOptions, datasets: [{ data: natureCounts, backgroundColor: COLORS }] }} options={pieOptions} /></div></div>
+          <div className="chart-card"><div className="chart-title">Breakdown by Call Category</div><div className="chart-wrap"><Pie data={{ labels: logCallCategoryOptions, datasets: [{ data: callCategoryCounts, backgroundColor: COLORS }] }} options={pieOptions} /></div></div>
         </div>
         <div className="section-title">Division-wise Analysis Table</div>
         <div className="table-wrap analysis-table" style={{ marginBottom: 20 }}>
@@ -1220,17 +2561,17 @@ export default function FMSModule() {
         <div className="section-title">Pivot Table — Type of Assets × Division</div>
         <div className="pivot-wrap">
           <table className="pivot-table">
-            <thead><tr><th>DIVISION</th>{ASSET_TYPES_SHORT.map((a) => <th key={a}>{a}</th>)}<th>TOTAL</th></tr></thead>
+            <thead><tr><th>DIVISION</th>{logAssetTypeOptions.map((assetType) => <th key={assetType}>{assetType}</th>)}<th>TOTAL</th></tr></thead>
             <tbody>
               {pivotData.rows.map((row) => (
                 <tr key={`pv-${row.division}`}>
                   <th>{row.division}</th>
-                  {row.values.map((v, i) => <td key={`${row.division}-${ASSET_TYPES_SHORT[i]}`} className={v > 0 ? "has-val" : ""}>{v}</td>)}
+                  {row.values.map((v, i) => <td key={`${row.division}-${logAssetTypeOptions[i]}`} className={v > 0 ? "has-val" : ""}>{v}</td>)}
                   <td style={{ fontWeight: 700, background: "#fff8e1" }}>{row.total}</td>
                 </tr>
               ))}
             </tbody>
-            <tfoot><tr><td><strong>TOTAL</strong></td>{pivotData.colTotals.map((v, i) => <td key={`tot-${ASSET_TYPES_SHORT[i]}`}>{v}</td>)}<td><strong>{pivotData.grandTotal}</strong></td></tr></tfoot>
+            <tfoot><tr><td><strong>TOTAL</strong></td>{pivotData.colTotals.map((v, i) => <td key={`tot-${logAssetTypeOptions[i]}`}>{v}</td>)}<td><strong>{pivotData.grandTotal}</strong></td></tr></tfoot>
           </table>
         </div>
         <div className="section-title" style={{ marginTop: 24 }}>Engineer-wise Performance</div>
@@ -1243,29 +2584,44 @@ export default function FMSModule() {
         </div>
       </div>
 
-      <Modal open={logModal.open} title={logModal.idx >= 0 ? "Edit Call Record" : "Add New Call"} onClose={() => setLogModal({ open: false, idx: -1 })} footer={<><button type="button" className="btn btn-outline" onClick={() => setLogModal({ open: false, idx: -1 })}>Cancel</button><button type="button" className="btn btn-primary" onClick={saveLogRecord}>Save Record</button></>}>
+      <Modal
+        open={logModal.open}
+        title={logModal.idx >= 0 ? "Edit Call Record" : "Add New Call"}
+        onClose={() => !isSavingLog && setLogModal({ open: false, idx: -1 })}
+        footer={
+          <>
+            <button type="button" className="btn btn-outline" onClick={() => setLogModal({ open: false, idx: -1 })} disabled={isSavingLog}>
+              Cancel
+            </button>
+            <button type="button" className="btn btn-primary" onClick={saveLogRecord} disabled={isSavingLog}>
+              {isSavingLog ? "Saving..." : "Save Record"}
+            </button>
+          </>
+        }
+      >
         <div className="form-grid">
           <div className="form-group"><label>Incident No.</label><input type="text" value={logForm.incidentNo} readOnly /></div>
           <div className="form-group"><label>Month</label><input type="text" placeholder="e.g. JUL-17" value={logForm.month} onChange={(e) => setLogForm((p) => ({ ...p, month: e.target.value }))} /></div>
           <div className="form-group"><label>Call Open Date/Time</label><input type="datetime-local" value={logForm.callOpenDate} onChange={(e) => setLogForm((p) => ({ ...p, callOpenDate: e.target.value }))} /></div>
-          <div className="form-group"><label>Division</label><select value={logForm.division} onChange={(e) => setLogForm((p) => ({ ...p, division: e.target.value, area: "" }))}><option value="">Select</option>{DIVISIONS.map((d) => <option key={d}>{d}</option>)}</select></div>
-          <div className="form-group"><label>Area</label><select value={logForm.area} onChange={(e) => setLogForm((p) => ({ ...p, area: e.target.value }))}><option value="">Select Area</option>{(AREAS[logForm.division] || []).map((a) => <option key={a}>{a}</option>)}</select></div>
+          <div className="form-group"><label>Division</label><input type="text" value={logForm.division} onChange={(e) => setLogForm((p) => ({ ...p, division: e.target.value }))} /></div>
+          <div className="form-group"><label>Area</label><input type="text" value={logForm.area} onChange={(e) => setLogForm((p) => ({ ...p, area: e.target.value }))} /></div>
           <div className="form-group"><label>Device / Machine Name</label><input type="text" value={logForm.machine} onChange={(e) => setLogForm((p) => ({ ...p, machine: e.target.value }))} /></div>
           <div className="form-group"><label>Asset No.</label><input type="text" value={logForm.assetNo} onChange={(e) => setLogForm((p) => ({ ...p, assetNo: e.target.value }))} /></div>
+          <div className="form-group"><label>Equipment Name</label><input type="text" value={logForm.equipmentName} onChange={(e) => setLogForm((p) => ({ ...p, equipmentName: e.target.value }))} /></div>
           <div className="form-group"><label>Assets / Non Assets</label><select value={logForm.assetNonAsset} onChange={(e) => setLogForm((p) => ({ ...p, assetNonAsset: e.target.value }))}><option>Assets</option><option>Non Assets</option></select></div>
-          <div className="form-group"><label>Type of Assets</label><select value={logForm.assetType} onChange={(e) => setLogForm((p) => ({ ...p, assetType: e.target.value }))}><option value="">Select</option>{ASSET_TYPES.map((t) => <option key={t}>{t}</option>)}</select></div>
-          <div className="form-group"><label>Call Category</label><select value={logForm.callCategory} onChange={(e) => setLogForm((p) => ({ ...p, callCategory: e.target.value }))}><option value="">Select</option>{CALL_CATEGORIES.map((c) => <option key={c}>{c}</option>)}</select></div>
-          <div className="form-group"><label>Equipment (Materials)</label><select value={logForm.equipment} onChange={(e) => setLogForm((p) => ({ ...p, equipment: e.target.value }))}>{EQUIPMENT_LIST.map((v) => <option key={v}>{v}</option>)}</select></div>
-          <div className="form-group"><label>Root Cause</label><select value={logForm.rootCause} onChange={(e) => setLogForm((p) => ({ ...p, rootCause: e.target.value }))}>{ROOT_CAUSES.map((r) => <option key={r}>{r}</option>)}</select></div>
+          <div className="form-group"><label>Nature of Call</label><input type="text" value={logForm.natureOfCall} onChange={(e) => setLogForm((p) => ({ ...p, natureOfCall: e.target.value }))} /></div>
+          <div className="form-group"><label>Type of Assets</label><input type="text" value={logForm.assetType} onChange={(e) => setLogForm((p) => ({ ...p, assetType: e.target.value }))} /></div>
+          <div className="form-group"><label>Call Category</label><input type="text" value={logForm.callCategory} onChange={(e) => setLogForm((p) => ({ ...p, callCategory: e.target.value }))} /></div>
+          <div className="form-group"><label>Equipment (Materials)</label><input type="text" value={logForm.equipment} onChange={(e) => setLogForm((p) => ({ ...p, equipment: e.target.value }))} /></div>
           <div className="form-group"><label>Repeated</label><select value={logForm.repeated} onChange={(e) => setLogForm((p) => ({ ...p, repeated: e.target.value }))}><option>NO</option><option>YES</option></select></div>
           <div className="form-group"><label>Problem Reported By</label><input type="text" value={logForm.reportedBy} onChange={(e) => setLogForm((p) => ({ ...p, reportedBy: e.target.value }))} /></div>
           <div className="form-group form-full"><label>Call Description</label><textarea value={logForm.description} onChange={(e) => setLogForm((p) => ({ ...p, description: e.target.value }))} /></div>
-          <div className="form-group"><label>Call Attended By</label><select value={logForm.attendedBy} onChange={(e) => setLogForm((p) => ({ ...p, attendedBy: e.target.value }))}><option value="">Select Engineer</option>{ENGINEERS.map((eng) => <option key={eng}>{eng}</option>)}</select></div>
+          <div className="form-group"><label>Call Attended By</label><input type="text" value={logForm.attendedBy} onChange={(e) => setLogForm((p) => ({ ...p, attendedBy: e.target.value }))} /></div>
           <div className="form-group"><label>Call Attend Date/Time</label><input type="datetime-local" value={logForm.attendDate} onChange={(e) => setLogForm((p) => ({ ...p, attendDate: e.target.value }))} /></div>
           <div className="form-group form-full"><label>Action Taken</label><textarea value={logForm.actionTaken} onChange={(e) => setLogForm((p) => ({ ...p, actionTaken: e.target.value }))} /></div>
           <div className="form-group"><label>Status</label><select value={logForm.status} onChange={(e) => setLogForm((p) => ({ ...p, status: e.target.value }))}><option>OPEN</option><option>CLOSED</option><option>HOLD</option></select></div>
           <div className="form-group"><label>Call Closed Date/Time</label><input type="datetime-local" value={logForm.closedDate} onChange={(e) => setLogForm((p) => ({ ...p, closedDate: e.target.value }))} /></div>
-          <div className="form-group"><label>Call Pending Side</label><select value={logForm.pendingSide} onChange={(e) => setLogForm((p) => ({ ...p, pendingSide: e.target.value }))}><option>TML</option><option>SGS</option></select></div>
+          <div className="form-group"><label>Call Pending Side</label><input type="text" value={logForm.pendingSide} onChange={(e) => setLogForm((p) => ({ ...p, pendingSide: e.target.value }))} /></div>
           <div className="form-group form-full"><label>Remarks</label><textarea style={{ minHeight: 50 }} value={logForm.remarks} onChange={(e) => setLogForm((p) => ({ ...p, remarks: e.target.value }))} /></div>
         </div>
       </Modal>

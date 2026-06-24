@@ -15,14 +15,17 @@ function errorHandler(err, req, res, next) {
 
   if (err instanceof ZodError) {
     return res.status(400).json({
+      message: "Validation failed",
       error: "Validation failed",
       details: err.issues.map((i) => ({ path: i.path.join("."), message: i.message }))
     });
   }
 
   const statusCode = err.statusCode || 500;
+  const message = err.message || "Internal server error";
   return res.status(statusCode).json({
-    error: err.message || "Internal server error",
+    message,
+    error: message,
     details: err.details || undefined
   });
 }

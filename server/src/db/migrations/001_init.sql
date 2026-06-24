@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS public.users (
   email TEXT NOT NULL UNIQUE,
   password_hash TEXT NOT NULL,
   module TEXT NOT NULL CHECK (module IN ('sgs-erc', 'sgs-fms', 'super')),
-  role TEXT NOT NULL CHECK (role IN ('super_admin', 'admin', 'engineer', 'client')),
+  role TEXT NOT NULL CHECK (role IN ('super_admin', 'admin', 'supervisor', 'engineer', 'client')),
   is_active BOOLEAN NOT NULL DEFAULT TRUE,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS erc.call_logs (
   location TEXT NOT NULL,
   issue_type TEXT NOT NULL,
   priority TEXT NOT NULL CHECK (priority IN ('low', 'medium', 'high', 'critical')),
-  status TEXT NOT NULL CHECK (status IN ('open', 'in_progress', 'resolved', 'closed')),
+  status TEXT NOT NULL CHECK (status IN ('open', 'hold', 'in_progress', 'resolved', 'closed')),
   assigned_to INT REFERENCES public.users(id) ON DELETE SET NULL,
   description TEXT NOT NULL,
   created_by INT NOT NULL REFERENCES public.users(id) ON DELETE RESTRICT,
@@ -80,6 +80,33 @@ CREATE TABLE IF NOT EXISTS erc.notifications (
 CREATE TABLE IF NOT EXISTS fms.call_logs (
   id SERIAL PRIMARY KEY,
   reference_no TEXT NOT NULL UNIQUE,
+  call_no TEXT,
+  month TEXT,
+  call_open_dt TIMESTAMPTZ,
+  division TEXT,
+  area TEXT,
+  machine TEXT,
+  asset_no TEXT,
+  equipment_name TEXT,
+  asset_non_asset TEXT,
+  nature_of_call TEXT,
+  type_of_assets TEXT,
+  call_category TEXT,
+  equipment_materials TEXT,
+  repeated_call TEXT,
+  problem_reported_by TEXT,
+  call_description TEXT,
+  call_attended_by TEXT,
+  call_attend_dt TIMESTAMPTZ,
+  action_taken TEXT,
+  call_closed_dt TIMESTAMPTZ,
+  response_time_min NUMERIC(12,2),
+  resolution_time_min NUMERIC(12,2),
+  downtime_min NUMERIC(12,2),
+  pending_side TEXT,
+  remarks TEXT,
+  import_batch_id BIGINT,
+  client_request_id TEXT,
   caller_name TEXT NOT NULL,
   contact TEXT NOT NULL,
   location TEXT NOT NULL,
@@ -93,6 +120,61 @@ CREATE TABLE IF NOT EXISTS fms.call_logs (
   severity TEXT,
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS fms.import_batches (
+  id BIGSERIAL PRIMARY KEY,
+  import_key TEXT NOT NULL UNIQUE,
+  file_name TEXT NOT NULL,
+  uploader_id INT REFERENCES public.users(id) ON DELETE SET NULL,
+  uploader_name TEXT,
+  file_size_bytes BIGINT,
+  total_rows INT NOT NULL DEFAULT 0,
+  imported_rows INT NOT NULL DEFAULT 0,
+  skipped_rows INT NOT NULL DEFAULT 0,
+  failed_rows INT NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'processing',
+  uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  completed_at TIMESTAMPTZ,
+  rolled_back_at TIMESTAMPTZ,
+  rolled_back_by INT REFERENCES public.users(id) ON DELETE SET NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS fms.import_errors (
+  id BIGSERIAL PRIMARY KEY,
+  batch_id BIGINT NOT NULL REFERENCES fms.import_batches(id) ON DELETE CASCADE,
+  row_number INT NOT NULL,
+  incident_no TEXT,
+  error_message TEXT NOT NULL,
+  row_data JSONB,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS fms.divisions (
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS fms.areas (
+  id BIGSERIAL PRIMARY KEY,
+  division_name TEXT NOT NULL,
+  name TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (division_name, name)
+);
+
+CREATE TABLE IF NOT EXISTS fms.call_categories (
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS fms.asset_types (
+  id BIGSERIAL PRIMARY KEY,
+  name TEXT NOT NULL UNIQUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS fms.call_updates (
@@ -130,7 +212,48 @@ CREATE TABLE IF NOT EXISTS fms.maintenance_schedules (
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE IF EXISTS fms.call_logs
+  ADD COLUMN IF NOT EXISTS call_no TEXT,
+  ADD COLUMN IF NOT EXISTS month TEXT,
+  ADD COLUMN IF NOT EXISTS call_open_dt TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS division TEXT,
+  ADD COLUMN IF NOT EXISTS area TEXT,
+  ADD COLUMN IF NOT EXISTS machine TEXT,
+  ADD COLUMN IF NOT EXISTS asset_no TEXT,
+  ADD COLUMN IF NOT EXISTS equipment_name TEXT,
+  ADD COLUMN IF NOT EXISTS asset_non_asset TEXT,
+  ADD COLUMN IF NOT EXISTS nature_of_call TEXT,
+  ADD COLUMN IF NOT EXISTS type_of_assets TEXT,
+  ADD COLUMN IF NOT EXISTS call_category TEXT,
+  ADD COLUMN IF NOT EXISTS equipment_materials TEXT,
+  ADD COLUMN IF NOT EXISTS repeated_call TEXT,
+  ADD COLUMN IF NOT EXISTS problem_reported_by TEXT,
+  ADD COLUMN IF NOT EXISTS call_description TEXT,
+  ADD COLUMN IF NOT EXISTS call_attended_by TEXT,
+  ADD COLUMN IF NOT EXISTS call_attend_dt TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS action_taken TEXT,
+  ADD COLUMN IF NOT EXISTS call_closed_dt TIMESTAMPTZ,
+  ADD COLUMN IF NOT EXISTS response_time_min NUMERIC(12,2),
+  ADD COLUMN IF NOT EXISTS resolution_time_min NUMERIC(12,2),
+  ADD COLUMN IF NOT EXISTS downtime_min NUMERIC(12,2),
+  ADD COLUMN IF NOT EXISTS pending_side TEXT,
+  ADD COLUMN IF NOT EXISTS remarks TEXT,
+  ADD COLUMN IF NOT EXISTS import_batch_id BIGINT,
+  ADD COLUMN IF NOT EXISTS client_request_id TEXT;
+
+ALTER TABLE IF EXISTS fms.call_logs
+  ADD CONSTRAINT fk_fms_call_logs_import_batch_id
+  FOREIGN KEY (import_batch_id) REFERENCES fms.import_batches(id) ON DELETE SET NULL;
+
 CREATE INDEX IF NOT EXISTS idx_erc_call_logs_status ON erc.call_logs(status);
 CREATE INDEX IF NOT EXISTS idx_fms_call_logs_status ON fms.call_logs(status);
 CREATE INDEX IF NOT EXISTS idx_erc_call_logs_priority ON erc.call_logs(priority);
 CREATE INDEX IF NOT EXISTS idx_fms_call_logs_priority ON fms.call_logs(priority);
+CREATE INDEX IF NOT EXISTS idx_fms_call_logs_reference_no ON fms.call_logs(reference_no);
+CREATE INDEX IF NOT EXISTS idx_fms_call_logs_month ON fms.call_logs(month);
+CREATE INDEX IF NOT EXISTS idx_fms_call_logs_division ON fms.call_logs(division);
+CREATE INDEX IF NOT EXISTS idx_fms_call_logs_area ON fms.call_logs(area);
+CREATE INDEX IF NOT EXISTS idx_fms_call_logs_machine ON fms.call_logs(machine);
+CREATE INDEX IF NOT EXISTS idx_fms_call_logs_call_category ON fms.call_logs(call_category);
+CREATE INDEX IF NOT EXISTS idx_fms_call_logs_type_of_assets ON fms.call_logs(type_of_assets);
+CREATE INDEX IF NOT EXISTS idx_fms_call_logs_import_batch_id ON fms.call_logs(import_batch_id);

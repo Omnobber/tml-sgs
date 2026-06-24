@@ -1,7 +1,6 @@
 const express = require("express");
 const { authRequired } = require("../../middleware/auth");
 const { moduleGuard, roleGuard } = require("../../middleware/guards");
-const callsController = require("../../controllers/callsController");
 const usersController = require("../../controllers/usersController");
 const reportsController = require("../../controllers/reportsController");
 const notificationsController = require("../../controllers/notificationsController");
@@ -11,10 +10,12 @@ const router = express.Router();
 
 router.use(authRequired, moduleGuard("sgs-fms"));
 
-router.get("/calls", callsController.list);
-router.post("/calls", roleGuard(["admin", "engineer"]), callsController.create);
-router.get("/calls/:id", callsController.detail);
-router.patch("/calls/:id", roleGuard(["admin", "engineer", "client"]), callsController.update);
+router.get("/calls", fmsController.listCallLogs);
+router.post("/calls", roleGuard(["admin", "engineer", "supervisor", "super_admin"]), fmsController.createCallLog);
+router.get("/calls/:id", fmsController.getCallLog);
+router.patch("/calls/:id", roleGuard(["admin", "engineer", "supervisor", "super_admin"]), fmsController.updateCallLog);
+router.delete("/calls/:id", roleGuard(["admin", "engineer", "supervisor", "super_admin"]), fmsController.deleteCallLog);
+router.post("/calls/delete", roleGuard(["admin", "engineer", "supervisor", "super_admin"]), fmsController.deleteCallLogs);
 
 router.get("/reports/summary", roleGuard(["admin", "engineer"]), reportsController.moduleSummary);
 
@@ -29,5 +30,9 @@ router.get("/vehicle-status", fmsController.vehicleStatus);
 router.get("/maintenance", roleGuard(["admin", "engineer"]), fmsController.listMaintenance);
 router.post("/maintenance", roleGuard(["admin", "engineer"]), fmsController.createMaintenance);
 router.patch("/maintenance/:id", roleGuard(["admin", "engineer"]), fmsController.updateMaintenance);
+router.get("/imports", roleGuard(["admin", "supervisor"]), fmsController.listImportHistory);
+router.post("/imports", roleGuard(["admin", "supervisor"]), fmsController.importCallLogs);
+router.get("/imports/:id/errors", roleGuard(["admin", "supervisor"]), fmsController.listImportErrors);
+router.post("/imports/rollback-last", roleGuard(["admin", "supervisor"]), fmsController.rollbackLastImport);
 
 module.exports = router;
